@@ -1,0 +1,421 @@
+from typing import Any, Optional
+from pydantic import BaseModel
+from unstructured.partition.pdf import partition_pdf
+import re
+import os
+import uuid
+import base64
+import ollama
+
+from langchain_ollama import ChatOllama
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.retrievers.multi_vector import MultiVectorRetriever
+from langchain.storage import InMemoryStore
+from langchain_chroma import Chroma
+from langchain_community.embeddings import GPT4AllEmbeddings
+from langchain_core.documents import Document
+
+class Element(BaseModel):
+    type: str
+    text: Any
+    context: Optional[str] = None
+    original_index: Optional[int] = None
+
+def load_book(file_name, image_output_dir="./figures"):
+    """
+    Loads a PDF book and partitions its elements (text, tables, images) using Unstructured.
+    
+    Args:
+        file_name (str): The path to the PDF file.
+        image_output_dir (str, optional): Directory to save extracted images.
+                                         Defaults to "./figures".
+                                         
+    Returns:
+        list: A list of raw elements extracted from the PDF.
+    """
+    # Path to save images
+    os.makedirs(image_output_dir, exist_ok=True)
+    # Get elements
+    raw_pdf_elements = partition_pdf(
+        filename=file_name,
+        languages=['eng'],
+        strategy='hi_res',
+        extract_images_in_pdf=True,
+        infer_table_structure=True,
+        image_output_dir_path=image_output_dir,
+    )
+    return raw_pdf_elements
+
+def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=20, window_size=5):
+    """
+    Cleans and categorizes raw PDF elements into texts, tables, and images.
+    Also enriches image contexts by looking at surrounding text.
+
+    Args:
+        raw_pdf_elements (list): A list of raw elements obtained from partition_pdf.
+        min_meaningful_text_length (int, optional): Minimum length for a text block to be considered meaningful. Defaults to 20.
+        window_size (int, optional): Number of elements before and after an image to consider for context. Defaults to 5.
+
+    Returns:
+        tuple: A tuple containing:
+            - texts (list): List of cleaned text chunks.
+            - tables (list): List of extracted table contents.
+            - images_raw (list): List of Element objects for images with enriched context.
+            - headers_raw (list): List of raw header elements.
+            - titles_raw (list): List of raw title elements.
+            - footers_raw (list): List of raw footer elements.
+            - figure_captions_raw (list): List of raw figure caption elements.
+            - list_items_raw (list): List of raw list item elements.
+    """
+    text_for_semantic_chunking = []
+    tables_raw = []
+    images_raw = []
+    headers_raw = []
+    titles_raw = []
+    footers_raw = []
+    figure_captions_raw = []
+    list_items_raw = []
+
+    current_text_block = ""
+    current_context_prefix = ""
+
+    def finalize_text_block_inner():
+        nonlocal current_text_block, current_context_prefix
+        if current_text_block.strip() and len(current_text_block.strip()) >= min_meaningful_text_length:
+            text_for_semantic_chunking.append(Element(type="text", text=current_text_block.strip()))
+        current_text_block = ""
+
+    for i, element in enumerate(raw_pdf_elements):
+        element_type_str = str(type(element))
+        element_text = str(element).strip()
+
+        if "unstructured.documents.elements.Header" in element_type_str:
+            finalize_text_block_inner()
+            
+            is_running_header = False
+            lower_element_text = element_text.lower()
+            if (
+                "qxp" in lower_element_text or
+                "pm" in lower_element_text or
+                "am" in lower_element_text or
+                "page" in lower_element_text or
+                re.search(r'\\d{1,2}/\\d{1,2}/\\d{2,4}', lower_element_text)
+            ):
+                is_running_header = True
+
+            if not is_running_header:
+                current_context_prefix = element_text + " "
+            headers_raw.append(Element(type="header", text=element_text, original_index=i))
+        elif "unstructured.documents.elements.Title" in element_type_str:
+            finalize_text_block_inner()
+            current_context_prefix = element_text + " "
+            titles_raw.append(Element(type="title", text=element_text, original_index=i))
+        elif "unstructured.documents.elements.NarrativeText" in element_type_str or \
+             "unstructured.documents.elements.ListItem" in element_type_str or \
+             "unstructured.documents.elements.Text" in element_type_str:
+            
+            if len(element_text) < 5 and not any(char.isalpha() for char in element_text):
+                continue
+
+            if not current_text_block and current_context_prefix:
+                current_text_block += current_context_prefix
+                
+            current_text_block += element_text + " "
+            if "unstructured.documents.elements.ListItem" in element_type_str:
+                list_items_raw.append(Element(type="list_item", text=element_text, original_index=i))
+
+        elif "unstructured.documents.elements.Table" in element_type_str:
+            finalize_text_block_inner()
+            tables_raw.append(Element(type="table", text=element_text, original_index=i))
+        elif "unstructured.documents.elements.Image" in element_type_str:
+            finalize_text_block_inner()
+
+            image_path = getattr(element.metadata, "image_path", "N/A")
+            images_raw.append(Element(type="image", text=image_path, context="", original_index=i))
+            current_text_block = ""
+
+        elif "unstructured.documents.elements.FigureCaption" in element_type_str:
+            finalize_text_block_inner()
+            figure_captions_raw.append(Element(type="figure_caption", text=element_text, original_index=i))
+        elif "unstructured.documents.elements.Footer" in element_type_str:
+            footers_raw.append(Element(type="footer", text=element_text, original_index=i))
+
+    finalize_text_block_inner()
+
+    enrich_image_context(images_raw, raw_pdf_elements, window_size=window_size)
+
+    texts = [e.text for e in text_for_semantic_chunking]
+    tables = [e.text for e in tables_raw]
+    
+    return texts, tables, images_raw, headers_raw, titles_raw, footers_raw, figure_captions_raw, list_items_raw
+
+def enrich_image_context(images, all_raw_elements, window_size=3):
+    """
+    Enriches the context for each image by looking at a window of surrounding text and captions.
+
+    Args:
+        images (list): A list of image Element objects to enrich.
+        all_raw_elements (list): All raw elements from the PDF, used to find surrounding text.
+        window_size (int, optional): Number of elements to look before and after the image. Defaults to 3.
+    """
+    for img_element in images:
+        img_index = img_element.original_index
+        if img_index is None:
+            continue
+
+        start_index = max(0, img_index - window_size)
+        end_index = min(len(all_raw_elements), img_index + window_size + 1)
+        
+        surrounding_text_elements = []
+        for j in range(start_index, end_index):
+            surrounding_element = all_raw_elements[j]
+            element_type_str = str(type(surrounding_element))
+            element_text = str(surrounding_element).strip()
+
+            if "unstructured.documents.elements.NarrativeText" in element_type_str or \
+               "unstructured.documents.elements.ListItem" in element_type_str or \
+               "unstructured.documents.elements.Text" in element_type_str or \
+               "unstructured.documents.elements.FigureCaption" in element_type_str:
+                
+                if len(element_text) >= 5 or any(char.isalpha() for char in element_text):
+                     surrounding_text_elements.append(element_text)
+            
+            if "unstructured.documents.elements.Header" in element_type_str or \
+               "unstructured.documents.elements.Title" in element_type_str:
+                lower_element_text = element_text.lower()
+                is_running_header = (
+                    "qxp" in lower_element_text or "pm" in lower_element_text or
+                    "am" in lower_element_text or "page" in lower_element_text or
+                    re.search(r'\\d{1,2}/\\d{1,2}/\\d{2,4}', lower_element_text)
+                )
+                if not is_running_header:
+                    surrounding_text_elements.append(element_text)
+
+
+        enriched_context = " ".join(surrounding_text_elements).strip()
+        if not enriched_context:
+            enriched_context = "No specific text context available around this image."
+        
+        img_element.context = enriched_context
+
+def summarize_elements(texts, tables, images_raw):
+    """
+    Summarizes text, table, and relevant image elements using Ollama models.
+    Also performs an image relevance check to filter out irrelevant images before summarization.
+
+    Args:
+        texts (list): List of text chunks to summarize.
+        tables (list): List of table contents to summarize.
+        images_raw (list): List of Element objects for images with enriched context.
+
+    Returns:
+        tuple: A tuple containing:
+            - text_summaries (list): Summaries of text chunks.
+            - table_summaries (list): Summaries of table contents.
+            - img_summaries (list): Summaries of relevant images.
+            - image_paths (list): Paths of the relevant images.
+            - relevant_images_to_summarize (list): Element objects of images deemed relevant.
+    """
+    model = ChatOllama(model="llama3.2")
+
+    prompt_text_summary = "You are an assistant tasked with concisely summarizing text sections related to veterinary advice and pet care. Focus on key information, main ideas, and any actionable advice. Just give me the summary, be concise and do not be verbose. Text chunk: {element} "
+    prompt_text = ChatPromptTemplate.from_template(prompt_text_summary)
+    text_summarize_chain = {"element": lambda x: x} | prompt_text | model | StrOutputParser()
+
+    prompt_table_summary = "You are an assistant tasked with extracting key data, trends, and important numerical information from the provided table, especially when related to pet nutrition, health, or statistics. Just give me the summary, be concise and do not be verbose. Table chunk: {element} "
+    prompt_table = ChatPromptTemplate.from_template(prompt_table_summary)
+    table_summarize_chain = {"element": lambda x: x} | prompt_table | model | StrOutputParser()
+
+    text_summaries = text_summarize_chain.batch(texts, {"max_concurrency": 8})
+    table_summaries = table_summarize_chain.batch(tables, {"max_concurrency": 8})
+
+    relevant_images_to_summarize = []
+    print("Checking image relevance with local textual context...")
+    for image_element in images_raw:
+        image_filename = image_element.text
+        image_context = image_element.context
+
+        if not image_context:
+            image_context = "No specific text context was captured for this image, infer relevance from filename."
+
+        messages_for_ollama = [
+            {
+                "role": "user",
+                "content": f"Local Textual Context: {image_context}\n\nImage Filename: {os.path.basename(image_filename)}\n\nIs this image relevant to the content? Respond with 'yes' if relevant, 'no' if not. Only respond with 'yes' or 'no'.",
+                "images": []
+            }
+        ]
+
+        if os.path.exists(image_filename):
+            messages_for_ollama[0]["images"].append(image_filename)
+        else:
+            print(f"WARNING: Image file not found: {image_filename}. Cannot pass image data to model.")
+
+        response_content = "no"
+        try:
+            response_obj = ollama.chat(
+                model="minicpm-v:8b", # Or your preferred vision model
+                messages=messages_for_ollama,
+                options={"temperature": 0.0}
+            )
+            response_content = response_obj['message']['content']
+        except Exception as e:
+            print(f"ERROR: Failed to invoke Ollama for image relevance check on {image_filename}: {e}")
+            response_content = "no"
+
+        if "yes" in response_content.lower().strip():
+            relevant_images_to_summarize.append(image_element)
+        else:
+            print(f"Skipping irrelevant image: {image_filename}")
+
+    print(f"Number of relevant images for summarization: {len(relevant_images_to_summarize)}")
+
+    img_summaries = []
+    image_paths = []
+    image_summarization_prompt = 'Describe the image in detail, focusing on any actions, techniques, or procedures depicted related to pet handling or care. Explain the purpose or context of the actions shown, if clear. Be concise and relevant to veterinary advice. If you think the images has nothing to do with veterinary, do not do anything.'
+
+    for img_element in relevant_images_to_summarize:
+        image_path = img_element.text
+        if os.path.exists(image_path):
+            try:
+                with open(image_path, 'rb') as f:
+                    image_data = base64.b64encode(f.read()).decode('utf-8')
+                
+                response = ollama.chat(
+                    model='llava:7b', # Or your preferred vision model for summarization
+                    messages=[
+                        {
+                            'role': 'user',
+                            'content': image_summarization_prompt,
+                            'images': [image_data]
+                        }
+                    ]
+                )
+                summary = response['message']['content']
+                img_summaries.append(summary)
+                image_paths.append(image_path)
+            except Exception as e:
+                print(f"Error summarizing image {image_path}: {e}")
+        else:
+            print(f"Image file not found for summarization: {image_path}")
+
+    return text_summaries, table_summaries, img_summaries, image_paths, relevant_images_to_summarize
+
+def store_in_chromadb(text_summaries, texts, table_summaries, tables, img_summaries, image_paths, persist_directory="./chroma_db"):
+    """
+    Stores the summarized text, table, and image data into a ChromaDB vector store on disk.
+
+    Args:
+        text_summaries (list): Summaries of text chunks.
+        texts (list): Original text chunks (parent documents).
+        table_summaries (list): Summaries of table contents.
+        tables (list): Original table contents (parent documents).
+        img_summaries (list): Summaries of relevant images.
+        image_paths (list): Paths of the relevant images (parent documents).
+        persist_directory (str, optional): The directory where the ChromaDB collection will be persisted.
+                                          Defaults to "./chroma_db".
+
+    Returns:
+        MultiVectorRetriever: An initialized MultiVectorRetriever object.
+    """
+    # Initialize ChromaDB with a persist directory for summaries
+    summary_vectorstore = Chroma(
+        collection_name="summaries",
+        embedding_function=GPT4AllEmbeddings(),
+        persist_directory=persist_directory
+    )
+
+    # Initialize a separate ChromaDB for original texts (parent documents) for persistence
+    original_text_vectorstore = Chroma(
+        collection_name="original_texts",
+        embedding_function=GPT4AllEmbeddings(), # Still needs an embedding function even if not used for search
+        persist_directory=persist_directory
+    )
+
+    print(f"Using ChromaDB for summaries at: {persist_directory} (collection: summaries)")
+    print(f"Using ChromaDB for original texts at: {persist_directory} (collection: original_texts)")
+    
+    # The storage layer for the parent documents for MultiVectorRetriever (in-memory)
+    store = InMemoryStore()
+    id_key = "doc_id"
+
+    retriever = MultiVectorRetriever(
+        vectorstore=summary_vectorstore, # Summaries are indexed here for retrieval
+        docstore=store,     # Original documents (parent) are stored here in-memory for the retriever
+        id_key=id_key,
+    )
+
+    if texts:
+        doc_ids = [str(uuid.uuid4()) for _ in texts]
+        summary_texts = [
+            Document(page_content=s, metadata={id_key: doc_ids[i]})
+            for i, s in enumerate(text_summaries)
+        ]
+        original_text_docs = [
+            Document(page_content=t, metadata={id_key: doc_ids[i]})
+            for i, t in enumerate(texts)
+        ]
+        retriever.vectorstore.add_documents(summary_texts) # Add summaries to summary_vectorstore
+        original_text_vectorstore.add_documents(original_text_docs) # Persist original texts to original_text_vectorstore
+        retriever.docstore.mset(list(zip(doc_ids, texts))) # Add original texts to InMemoryStore for MultiVectorRetriever
+
+    if tables:
+        table_ids = [str(uuid.uuid4()) for _ in tables]
+        summary_tables = [
+            Document(page_content=s, metadata={id_key: table_ids[i]})
+            for i, s in enumerate(table_summaries)
+        ]
+        original_table_docs = [
+            Document(page_content=t, metadata={id_key: table_ids[i]})
+            for i, t in enumerate(tables)
+        ]
+        retriever.vectorstore.add_documents(summary_tables) # Add table summaries to summary_vectorstore
+        original_text_vectorstore.add_documents(original_table_docs) # Persist original tables to original_text_vectorstore
+        retriever.docstore.mset(list(zip(table_ids, tables))) # Add original tables to InMemoryStore
+
+    if img_summaries:
+        img_ids = [str(uuid.uuid4()) for _ in img_summaries]
+        summary_img = [
+            Document(page_content=s, metadata={id_key: img_ids[i]})
+            for i, s in enumerate(img_summaries)
+        ]
+        original_img_paths_docs = [
+            Document(page_content=p, metadata={id_key: img_ids[i]})
+            for i, p in enumerate(image_paths)
+        ]
+        retriever.vectorstore.add_documents(summary_img) # Add image summaries to summary_vectorstore
+        original_text_vectorstore.add_documents(original_img_paths_docs) # Persist original image paths to original_text_vectorstore
+        retriever.docstore.mset(list(zip(img_ids, image_paths))) # Add image paths to InMemoryStore
+    
+    return retriever
+
+def delete_irrelevant_images(images_raw, relevant_images_to_summarize):
+    """
+    Deletes image files that were identified as irrelevant during the summarization process.
+
+    Args:
+        images_raw (list): All original image Element objects.
+        relevant_images_to_summarize (list): Element objects of images deemed relevant and summarized.
+    """
+    relevant_image_paths = {img_elem.text for img_elem in relevant_images_to_summarize}
+    images_deleted_count = 0
+    for image_element in images_raw:
+        image_path = image_element.text
+        if image_path not in relevant_image_paths:
+            if os.path.exists(image_path):
+                try:
+                    os.remove(image_path)
+                    print(f"Successfully deleted irrelevant image: {image_path}")
+                    images_deleted_count += 1
+                except OSError as e:
+                    print(f"Error deleting file {image_path}: {e}")
+            else:
+                print(f"Skipping deletion: Image file not found at {image_path}")
+    print(f"Finished deleting images. Total deleted: {images_deleted_count}")
+
+
+
+
+
+
