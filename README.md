@@ -35,8 +35,6 @@ This project is a Retrieval-Augmented Generation (RAG) pipeline for veterinary t
 
 1. **Install dependencies:**
    ```bash
-   pip install -r requirements.txt
-   # Or install individually:
    pip install langchain langchain-experimental langchain-chroma pillow open_clip_torch torch matplotlib unstructured pydantic
    ```
 
