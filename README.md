@@ -1,61 +1,83 @@
-# LLM Veterinary AI: Multimodal Vet Assistant
+# 🐾 Veterinary Textbook RAG Pipeline
 
-## Project Overview
-
-**LLM Veterinary AI** is an open-source project building an intelligent veterinary assistant powered by Retrieval-Augmented Generation (RAG) with multimodal capabilities. This system answers veterinary questions using information from text, images, tables, and more—delivering accurate, context-rich responses for veterinary use cases.
+This project is a Retrieval-Augmented Generation (RAG) pipeline for veterinary textbooks. It enables semantic search and retrieval over both text and images, allowing users to query for veterinary advice, procedures, and visual references using natural language.
 
 ## Features
 
-- **Multimodal RAG Pipeline**
-  - Extracts and summarizes content from PDFs, including text, tables, and images (using `unstructured`).
-  - Generates image summaries with vision-capable LLMs (e.g., Llama3.2-vision, Llava).
-  - Stores all content (text summaries, table summaries, image summaries) in a vector database for semantic retrieval.
-- **Flexible Retrieval**
-  - Uses semantic search to find and combine the most relevant text, tables, and images for a given query.
-  - Dynamically presents the answer, including images, in Markdown format.
-- **Veterinary Domain Focus**
-  - Example: "How do I pick up a cat?" returns both procedural text and illustrative images drawn from the dataset.
-- **Extensible Design**
-  - Easily add new data types and integrate more advanced models in the future.
+- **PDF Ingestion:** Partition and extract text, tables, and images from veterinary textbooks.
+- **Contextual Chunking:** Text and images are chunked and enriched with surrounding context for better retrieval.
+- **Image Summarization:** Images are summarized using a vision-language model, with summaries tied to their local text context.
+- **Multimodal Embeddings:** Both text and image summaries are embedded into a shared vector space using OpenCLIP, enabling cross-modal retrieval.
+- **Semantic Search:** Users can search using natural language and retrieve relevant text, tables, and images.
+- **Original Content Retrieval:** Each summary is linked to its original full text, table, or image for detailed reference.
+- **Irrelevant Image Filtering:** Only images relevant to veterinary content are kept and summarized.
 
 ## How It Works
 
-1. **Data Ingestion**
-    - PDFs are partitioned into text, tables, and images.
-    - Each segment is summarized using LLMs for concise storage and retrieval.
+1. **Ingestion:**  
+   - Load a PDF and extract its elements (text, tables, images).
+   - Clean and chunk the text, enrich image context, and filter irrelevant images.
+   - Summarize text, tables, and images (with context-aware prompts for images).
+   - Store summaries and originals in ChromaDB vector stores using OpenCLIP embeddings.
 
-2. **Image Processing**
-    - Images are described by vision models; summaries are saved alongside the originals.
+2. **Retrieval:**  
+   - User submits a natural language query.
+   - The query is embedded with OpenCLIP and used to search the summary vector store.
+   - Top results (text, table, or image summaries) are returned, with links to the original content.
 
-3. **Vector Store**
-    - All summaries (text, tables, images) are embedded and stored in a vector DB (Chroma + in-memory store).
+## Example Query
 
-4. **Retrieval & Answer Generation**
-    - The retriever locates the most relevant text, tables, and images for a user query.
-    - The multimodal LLM combines these elements to generate a comprehensive, illustrated answer.
-    - Responses include Markdown-rendered images where helpful.
+> "How do I safely pick up a cat for examination?"
 
-## Example
+- Returns relevant text instructions, tables, and images (with summaries) about cat handling and restraint.
 
-**User Query:**  
-`Can you show me how to pick up a cat? Include images.`
+## Setup
 
-**Sample Output:**  
-- Step-by-step instructions (with safety tips for cooperative, apprehensive, or frightened cats).
-- Embedded images illustrating proper techniques.
+1. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   # Or install individually:
+   pip install langchain langchain-experimental langchain-chroma pillow open_clip_torch torch matplotlib unstructured pydantic
+   ```
 
-## Dependencies
+2. **Prepare your data:**
+   - Place your PDF(s) in the `./data/` directory.
 
-- Python 3.x
-- Jupyter Notebook
-- Key libraries:
-  - `langchain`, `langchain-chroma`
-  - `unstructured[all-docs]`
-  - `pydantic`, `lxml`
-  - Vision model support: `ollama` (for Llama3.2-vision, Llava, etc.)
-  - `Chroma`, `GPT4AllEmbeddings`, `Pillow`
+3. **Run the ingestion pipeline:**
+   ```python
+   # Example usage in a script or notebook
+   from textbook_loading import run_ingestion
+   retriever = run_ingestion('./data/your_textbook.pdf')
+   ```
 
-Install the main dependencies with:
+4. **Query the retriever:**
+   ```python
+   query = "How to pick up a cooperative cat?"
+   docs = retriever.invoke(query, k=8)
+   for doc in docs:
+       print(doc.page_content)
+       # Use doc.metadata['image_path'] to display images if needed
+   ```
 
-```bash
-pip install langchain langchain-chroma "unstructured[all-docs]" pydantic lxml
+## Customization
+
+- **Image Summarization Prompt:**  
+  The prompt for image summarization is context-aware and can be customized in `textbook_loading.py` for your specific needs.
+
+- **Chunking Window Size:**  
+  Adjust the `window_size` parameter in `clean_and_categorize_elements` for more or less context around images.
+
+## Notes
+
+- **OpenCLIP** is used for all embeddings, ensuring text and images are in the same vector space.
+- **ChromaDB** is used for fast vector search and persistent storage.
+- **Ollama** and vision-language models (e.g., `llava:7b`, `minicpm-v:8b`) are used for image relevance and summarization.
+
+## Troubleshooting
+
+- If you change your chunking, summarization, or ingestion logic, **delete the ChromaDB directory and re-ingest** to avoid stale or mismatched data.
+- Make sure all dependencies are installed and your models are available locally.
+
+## License
+
+MIT License
