@@ -13,7 +13,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain.retrievers.multi_vector import MultiVectorRetriever
 from langchain.storage import InMemoryStore
 from langchain_chroma import Chroma
-from langchain_community.embeddings import GPT4AllEmbeddings
+from langchain_experimental.open_clip import OpenCLIPEmbeddings
+#from langchain_community.embeddings import GPT4AllEmbeddings
 from langchain_core.documents import Document
 
 class Element(BaseModel):
@@ -47,7 +48,7 @@ def load_book(file_name, image_output_dir="./figures"):
     )
     return raw_pdf_elements
 
-def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=20, window_size=5):
+def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=20, window_size=1):
     """
     Cleans and categorizes raw PDF elements into texts, tables, and images.
     Also enriches image contexts by looking at surrounding text.
@@ -150,7 +151,7 @@ def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=2
     
     return texts, tables, images_raw, headers_raw, titles_raw, footers_raw, figure_captions_raw, list_items_raw
 
-def enrich_image_context(images, all_raw_elements, window_size=3):
+def enrich_image_context(images, all_raw_elements, window_size=1):
     """
     Enriches the context for each image by looking at a window of surrounding text and captions.
 
@@ -271,23 +272,30 @@ def summarize_elements(texts, tables, images_raw):
 
     print(f"Number of relevant images for summarization: {len(relevant_images_to_summarize)}")
 
+    # Generating summaries for those relevant images.
     img_summaries = []
     image_paths = []
-    image_summarization_prompt = 'Describe the image in detail, focusing on any actions, techniques, or procedures depicted related to pet handling or care. Explain the purpose or context of the actions shown, if clear. Be concise and relevant to veterinary advice. If you think the images has nothing to do with veterinary, do not do anything.'
 
     for img_element in relevant_images_to_summarize:
         image_path = img_element.text
+        context = img_element.context or ""
         if os.path.exists(image_path):
             try:
                 with open(image_path, 'rb') as f:
                     image_data = base64.b64encode(f.read()).decode('utf-8')
                 
+                prompt = (
+                    "As a veterinary assistant, explain how you would use the following image in the context of the provided text. "
+                    "Focus on the specific actions, techniques, or procedures depicted, and relate them to the veterinary scenario described. "
+                    "Be concise, use direct language, and include likely search terms (e.g., 'cat restraint', 'scruffing', 'handling technique').\n\n"
+                    f"Context: {context}"
+                )
                 response = ollama.chat(
-                    model='llava:7b', # Or your preferred vision model for summarization
+                    model='minicpm-v:8b',
                     messages=[
                         {
                             'role': 'user',
-                            'content': image_summarization_prompt,
+                            'content': prompt,
                             'images': [image_data]
                         }
                     ]
@@ -319,22 +327,32 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, img_summar
     Returns:
         MultiVectorRetriever: An initialized MultiVectorRetriever object.
     """
+    # Initialize OpenCLIPEmbeddings for both text and image embeddings
+    open_clip_embeddings = OpenCLIPEmbeddings(model_name="ViT-g-14", checkpoint="laion2b_s34b_b88k")
+
     # Initialize ChromaDB with a persist directory for summaries
     summary_vectorstore = Chroma(
         collection_name="summaries",
-        embedding_function=GPT4AllEmbeddings(),
+        embedding_function=open_clip_embeddings,
         persist_directory=persist_directory
     )
 
     # Initialize a separate ChromaDB for original texts (parent documents) for persistence
     original_text_vectorstore = Chroma(
         collection_name="original_texts",
-        embedding_function=GPT4AllEmbeddings(), # Still needs an embedding function even if not used for search
+        embedding_function=open_clip_embeddings, # Still needs an embedding function even if not used for search
+        persist_directory=persist_directory
+    )
+
+    original_image_vectorstore = Chroma(
+        collection_name="original_images",
+        embedding_function=open_clip_embeddings,
         persist_directory=persist_directory
     )
 
     print(f"Using ChromaDB for summaries at: {persist_directory} (collection: summaries)")
     print(f"Using ChromaDB for original texts at: {persist_directory} (collection: original_texts)")
+    print(f"Using ChromaDB for original images at: {persist_directory} (collection: original_images)")
     
     # The storage layer for the parent documents for MultiVectorRetriever (in-memory)
     store = InMemoryStore()
@@ -358,7 +376,7 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, img_summar
         ]
         retriever.vectorstore.add_documents(summary_texts) # Add summaries to summary_vectorstore
         original_text_vectorstore.add_documents(original_text_docs) # Persist original texts to original_text_vectorstore
-        retriever.docstore.mset(list(zip(doc_ids, texts))) # Add original texts to InMemoryStore for MultiVectorRetriever
+        retriever.docstore.mset(list(zip(doc_ids, original_text_docs))) # Add original texts to InMemoryStore for MultiVectorRetriever
 
     if tables:
         table_ids = [str(uuid.uuid4()) for _ in tables]
@@ -372,22 +390,25 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, img_summar
         ]
         retriever.vectorstore.add_documents(summary_tables) # Add table summaries to summary_vectorstore
         original_text_vectorstore.add_documents(original_table_docs) # Persist original tables to original_text_vectorstore
-        retriever.docstore.mset(list(zip(table_ids, tables))) # Add original tables to InMemoryStore
+        retriever.docstore.mset(list(zip(table_ids, original_table_docs))) # Add original tables to InMemoryStore
 
     if img_summaries:
         img_ids = [str(uuid.uuid4()) for _ in img_summaries]
-        summary_img = [
-            Document(page_content=s, metadata={id_key: img_ids[i]})
-            for i, s in enumerate(img_summaries)
+
+        # Store image summaries in the summary vectorstore
+        summary_img_docs = [
+            Document(page_content=img_summaries[i], metadata={id_key: img_ids[i], "image_path": image_paths[i]})
+            for i in range(len(img_summaries))
         ]
-        original_img_paths_docs = [
-            Document(page_content=p, metadata={id_key: img_ids[i]})
-            for i, p in enumerate(image_paths)
+        retriever.vectorstore.add_documents(summary_img_docs)
+
+        # Store the original image paths in the docstore for retrieval
+        original_img_docs = [
+            Document(page_content=image_paths[i], metadata={id_key: img_ids[i]})
+            for i in range(len(image_paths))
         ]
-        retriever.vectorstore.add_documents(summary_img) # Add image summaries to summary_vectorstore
-        original_text_vectorstore.add_documents(original_img_paths_docs) # Persist original image paths to original_text_vectorstore
-        retriever.docstore.mset(list(zip(img_ids, image_paths))) # Add image paths to InMemoryStore
-    
+        retriever.docstore.mset(list(zip(img_ids, original_img_docs)))
+
     return retriever
 
 def delete_irrelevant_images(images_raw, relevant_images_to_summarize):

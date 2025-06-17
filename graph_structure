@@ -1,0 +1,32 @@
+[Start]
+  |
+  V
+[Receive Inputs]
+  |
+  V
+[Image Pre-processing] (parallel)  [Query Refinement]
+  \                      /
+   V                    V
+[Combine Query & Context]
+  |
+  V
+[Multi-Modal Retrieval]
+  |
+  V
+[Context Augmentation]
+  |
+  V
+[Evaluate Context for Gaps]
+  |
+  +--- (IF "needs_more_info") ---+
+  |                              |
+  V                              V
+[Ask User for Clarification]   (IF "ready_to_answer")
+  |                              |
+  +--- (Loop back with new info) ---+
+  |
+  V
+[Multi-Modal Answer Generation]
+  |
+  V
+[End] you What 

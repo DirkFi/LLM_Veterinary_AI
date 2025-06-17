@@ -89,10 +89,25 @@ if __name__ == "__main__":
         print("\nIngestion process finished. You can now use the 'retriever' object for queries.")
         # Example query (this would typically be in another script or part of your application)
         query = "How to pick up a cooperative cat?"
-        docs = retriever.invoke(query)
-        print(f"\nRetrieved documents for query '{query}':")
+        print('-'*40, "Here are the retrieved original_docs",'-'*40)
+        docs = retriever.invoke(query, k=8)
+        print(f"\nThe query: '{query}':")
+        print(f"\nIn total there are {len(docs)} docs retrieved.")
         for doc in docs:
-            if hasattr(doc, 'page_content'):
-                print(doc.page_content[:200] + "...")
+            print('-' * 40)
+            if hasattr(doc, "page_content") and doc.page_content:
+                print("📝 Summary/Chunk:", doc.page_content)
+                # Check if this is likely an image
+                if isinstance(doc.page_content, str) and doc.page_content.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                    print("🖼️ This doc is likely an image. Image path:", doc.page_content)
             else:
-                print(str(doc)[:200] + "...") 
+                print("❓ No page_content in this doc. Full doc object:", doc)
+            doc_id = doc.metadata.get('doc_id') if hasattr(doc, "metadata") else None
+            if doc_id:
+                original = retriever.docstore.mget([doc_id])[0]
+                print("📄 Full Original Content:", original)
+                # If the original is a path to an image, print that info
+                if isinstance(original, str) and original.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                    print("🖼️ Original content is an image. Image path:", original)
+            else:
+                print("🚫 No doc_id found in metadata for this doc.") 
