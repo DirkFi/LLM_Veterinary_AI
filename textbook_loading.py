@@ -241,10 +241,18 @@ def summarize_elements(texts, tables, images_raw):
             image_context = "No specific text context was captured for this image, infer relevance from filename."
 
         messages_for_ollama = [
-            {
-                "role": "user",
-                "content": f"Local Textual Context: {image_context}\n\nImage Filename: {os.path.basename(image_filename)}\n\nIs this image relevant to the content? Respond with 'yes' if relevant, 'no' if not. Only respond with 'yes' or 'no'.",
-                "images": []
+        {
+            "role": "user",
+            "content": (
+                "You are a veterinary assistant helping to filter images for a veterinary knowledge base. "
+                "Given the following local textual context and the image filename, decide if the image is relevant to veterinary topics, animal care, or pet health. "
+                "If the context is clearly nonsense, random symbols, or not related to veterinary medicine (e.g., '--o--', '*92312*))____++', or similar gibberish), respond with 'no'. "
+                "If the image and context are relevant to veterinary topics, respond with 'yes'. "
+                "Only respond with 'yes' or 'no'.\n\n"
+                f"Local Textual Context: {image_context}\n"
+                f"Image Filename: {os.path.basename(image_filename)}"
+            ),
+            "images": []
             }
         ]
 
