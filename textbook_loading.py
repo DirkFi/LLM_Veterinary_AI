@@ -44,7 +44,7 @@ def load_book(file_name, image_output_dir="./figures"):
         strategy='hi_res',
         extract_images_in_pdf=True,
         infer_table_structure=True,
-        image_output_dir_path=image_output_dir,
+        extract_image_block_output_dir=image_output_dir,
     )
     return raw_pdf_elements
 
@@ -200,15 +200,57 @@ def enrich_image_context(images, all_raw_elements, window_size=1):
         
         img_element.context = enriched_context
 
-def summarize_elements(texts, tables, images_raw):
+def enrich_table_context(tables, all_raw_elements, window_size=1):
+    """
+    Enriches the context for each table by looking at a window of surrounding text and captions.
+
+    Args:
+        tables (list): A list of table Element objects to enrich.
+        all_raw_elements (list): All raw elements from the PDF, used to find surrounding text.
+        window_size (int, optional): Number of elements to look before and after the table. Defaults to 1.
+    """
+    for tbl_element in tables:
+        tbl_index = tbl_element.original_index
+        if tbl_index is None:
+            continue
+        start_index = max(0, tbl_index - window_size)
+        end_index = min(len(all_raw_elements), tbl_index + window_size + 1)
+        surrounding_text_elements = []
+        for j in range(start_index, end_index):
+            surrounding_element = all_raw_elements[j]
+            element_type_str = str(type(surrounding_element))
+            element_text = str(surrounding_element).strip()
+            if "unstructured.documents.elements.NarrativeText" in element_type_str or \
+               "unstructured.documents.elements.ListItem" in element_type_str or \
+               "unstructured.documents.elements.Text" in element_type_str or \
+               "unstructured.documents.elements.FigureCaption" in element_type_str:
+                if len(element_text) >= 5 or any(char.isalpha() for char in element_text):
+                    surrounding_text_elements.append(element_text)
+            if "unstructured.documents.elements.Header" in element_type_str or \
+               "unstructured.documents.elements.Title" in element_type_str:
+                lower_element_text = element_text.lower()
+                is_running_header = (
+                    "qxp" in lower_element_text or "pm" in lower_element_text or
+                    "am" in lower_element_text or "page" in lower_element_text or
+                    re.search(r'\\d{1,2}/\\d{1,2}/\\d{2,4}', lower_element_text)
+                )
+                if not is_running_header:
+                    surrounding_text_elements.append(element_text)
+        enriched_context = " ".join(surrounding_text_elements).strip()
+        if not enriched_context:
+            enriched_context = "No specific text context available around this table."
+        tbl_element.context = enriched_context
+
+def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
     """
     Summarizes text, table, and relevant image elements using Ollama models.
     Also performs an image relevance check to filter out irrelevant images before summarization.
 
     Args:
         texts (list): List of text chunks to summarize.
-        tables (list): List of table contents to summarize.
+        tables (list): List of table Element objects to summarize (with context).
         images_raw (list): List of Element objects for images with enriched context.
+        raw_pdf_elements (list, optional): All raw elements for context enrichment.
 
     Returns:
         tuple: A tuple containing:
@@ -224,12 +266,32 @@ def summarize_elements(texts, tables, images_raw):
     prompt_text = ChatPromptTemplate.from_template(prompt_text_summary)
     text_summarize_chain = {"element": lambda x: x} | prompt_text | model | StrOutputParser()
 
-    prompt_table_summary = "You are an assistant tasked with extracting key data, trends, and important numerical information from the provided table, especially when related to pet nutrition, health, or statistics. Just give me the summary, be concise and do not be verbose. Table chunk: {element} "
+    # Enrich table context if not already done
+    if raw_pdf_elements is not None and tables and hasattr(tables[0], 'context'):
+        enrich_table_context(tables, raw_pdf_elements, window_size=1)
+
+    prompt_table_summary = (
+        "You are an assistant tasked with extracting key information, trends, and important numerical data from the provided table, "
+        "especially as it relates to veterinary topics, animal health, or clinical practice. Use the provided context to help interpret the table. "
+        "Just give me the summary, be concise and do not be verbose.\n\n"
+        "Context: {context}\n"
+        "Table chunk: {element}"
+    )
     prompt_table = ChatPromptTemplate.from_template(prompt_table_summary)
-    table_summarize_chain = {"element": lambda x: x} | prompt_table | model | StrOutputParser()
+    table_summarize_chain = (
+        {"element": lambda x: x["element"], "context": lambda x: x["context"]}
+        | prompt_table
+        | model
+        | StrOutputParser()
+    )
+    # Prepare table-context pairs
+    table_context_pairs = []
+    for tbl in tables:
+        context = getattr(tbl, 'context', "")
+        table_context_pairs.append({"element": tbl.text if hasattr(tbl, 'text') else tbl, "context": context})
 
     text_summaries = text_summarize_chain.batch(texts, {"max_concurrency": 8})
-    table_summaries = table_summarize_chain.batch(tables, {"max_concurrency": 8})
+    table_summaries = table_summarize_chain.batch(table_context_pairs, {"max_concurrency": 8})
 
     relevant_images_to_summarize = []
     print("Checking image relevance with local textual context...")
@@ -293,9 +355,10 @@ def summarize_elements(texts, tables, images_raw):
                     image_data = base64.b64encode(f.read()).decode('utf-8')
                 
                 prompt = (
-                    "As a veterinary assistant, explain how you would use the following image in the context of the provided text. "
-                    "Focus on the specific actions, techniques, or procedures depicted, and relate them to the veterinary scenario described. "
-                    "Be concise, use direct language, and include likely search terms (e.g., 'cat restraint', 'scruffing', 'handling technique').\n\n"
+                    "From a veterinary point of view, explain what this image is about in the provided context. "
+                    "Focus on the specific actions, techniques, or procedures depicted, and relate them to the veterinary scenario described in the context. "
+                    "Be concise, use direct language, and include likely search terms based on the context.\n\n"
+                    "Avoid pleasantries"
                     f"Context: {context}"
                 )
                 response = ollama.chat(
