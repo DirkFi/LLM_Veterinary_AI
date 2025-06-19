@@ -23,6 +23,33 @@ class Element(BaseModel):
     text: Any
     context: Optional[str] = None
     original_index: Optional[int] = None
+class UnifiedRetriever:
+        def __init__(self, vectorstore, docstore, id_key="doc_id"):
+            self.vectorstore = vectorstore
+            self.docstore = docstore
+            self.id_key = id_key
+            self._collection = docstore._collection
+
+        def retrieve(self, query, k=5):
+            results = self.vectorstore.similarity_search_with_score(query, k=k)
+            output = []
+            for doc, score in results:
+                doc_id = doc.metadata.get(self.id_key)
+                try:
+                    original = self._collection.get(ids=[doc_id], include=["documents", "metadatas"])
+                    original_doc = original["documents"][0] if original["documents"] else None
+                    original_meta = original["metadatas"][0] if original["metadatas"] else None
+                except Exception as e:
+                    original_doc = None
+                    original_meta = None
+                output.append({
+                    "summary": doc.page_content,
+                    "original": original_doc,
+                    "original_metadata": original_meta,
+                    "summary_metadata": doc.metadata,
+                    "score": score
+                })
+            return output
 
 def load_book(file_name, image_output_dir="./figures"):
     """
@@ -456,34 +483,6 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, img_summar
         ]
         summary_vectorstore.add_documents(summary_img_docs, ids=img_ids)
         docstore.add_documents(original_img_docs, ids=img_ids)
-
-    class UnifiedRetriever:
-        def __init__(self, vectorstore, docstore, id_key="doc_id"):
-            self.vectorstore = vectorstore
-            self.docstore = docstore
-            self.id_key = id_key
-            self._collection = docstore._collection
-
-        def retrieve(self, query, k=5):
-            results = self.vectorstore.similarity_search_with_score(query, k=k)
-            output = []
-            for doc, score in results:
-                doc_id = doc.metadata.get(self.id_key)
-                try:
-                    original = self._collection.get(ids=[doc_id], include=["documents", "metadatas"])
-                    original_doc = original["documents"][0] if original["documents"] else None
-                    original_meta = original["metadatas"][0] if original["metadatas"] else None
-                except Exception as e:
-                    original_doc = None
-                    original_meta = None
-                output.append({
-                    "summary": doc.page_content,
-                    "original": original_doc,
-                    "original_metadata": original_meta,
-                    "summary_metadata": doc.metadata,
-                    "score": score
-                })
-            return output
 
     return UnifiedRetriever(summary_vectorstore, docstore, id_key)
 
