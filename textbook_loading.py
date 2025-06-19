@@ -6,6 +6,7 @@ import os
 import uuid
 import base64
 import ollama
+import json
 
 from langchain_ollama import ChatOllama
 from langchain_core.output_parsers import StrOutputParser
@@ -396,91 +397,95 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, img_summar
                                           Defaults to "./chroma_db".
 
     Returns:
-        MultiVectorRetriever: An initialized MultiVectorRetriever object.
+        UnifiedRetriever: An initialized retriever object for all modalities.
     """
-    # Initialize OpenCLIPEmbeddings for both text and image embeddings
     open_clip_embeddings = OpenCLIPEmbeddings(model_name="ViT-g-14", checkpoint="laion2b_s34b_b88k")
 
-    # Initialize ChromaDB with a persist directory for summaries
+    # Vectorstore for summaries (for similarity search)
     summary_vectorstore = Chroma(
         collection_name="summaries",
         embedding_function=open_clip_embeddings,
         persist_directory=persist_directory
     )
-
-    # Initialize a separate ChromaDB for original texts (parent documents) for persistence
-    original_text_vectorstore = Chroma(
-        collection_name="original_texts",
-        embedding_function=open_clip_embeddings, # Still needs an embedding function even if not used for search
-        persist_directory=persist_directory
-    )
-
-    original_image_vectorstore = Chroma(
-        collection_name="original_images",
+    # Persistent docstore for originals (all modalities)
+    docstore = Chroma(
+        collection_name="originals",
         embedding_function=open_clip_embeddings,
         persist_directory=persist_directory
     )
-
-    print(f"Using ChromaDB for summaries at: {persist_directory} (collection: summaries)")
-    print(f"Using ChromaDB for original texts at: {persist_directory} (collection: original_texts)")
-    print(f"Using ChromaDB for original images at: {persist_directory} (collection: original_images)")
-    
-    # The storage layer for the parent documents for MultiVectorRetriever (in-memory)
-    store = InMemoryStore()
     id_key = "doc_id"
 
-    retriever = MultiVectorRetriever(
-        vectorstore=summary_vectorstore, # Summaries are indexed here for retrieval
-        docstore=store,     # Original documents (parent) are stored here in-memory for the retriever
-        id_key=id_key,
-    )
-
+    # Store text chunks
     if texts:
         doc_ids = [str(uuid.uuid4()) for _ in texts]
         summary_texts = [
-            Document(page_content=s, metadata={id_key: doc_ids[i]})
+            Document(page_content=s, metadata={id_key: doc_ids[i], "type": "text"})
             for i, s in enumerate(text_summaries)
         ]
         original_text_docs = [
-            Document(page_content=t, metadata={id_key: doc_ids[i]})
-            for i, t in enumerate(texts)
+            Document(page_content=texts[i], metadata={id_key: doc_ids[i], "type": "text"})
+            for i in range(len(texts))
         ]
-        retriever.vectorstore.add_documents(summary_texts) # Add summaries to summary_vectorstore
-        original_text_vectorstore.add_documents(original_text_docs) # Persist original texts to original_text_vectorstore
-        retriever.docstore.mset(list(zip(doc_ids, original_text_docs))) # Add original texts to InMemoryStore for MultiVectorRetriever
+        summary_vectorstore.add_documents(summary_texts, ids=doc_ids)
+        docstore.add_documents(original_text_docs, ids=doc_ids)
 
+    # Store tables as JSON
     if tables:
         table_ids = [str(uuid.uuid4()) for _ in tables]
         summary_tables = [
-            Document(page_content=s, metadata={id_key: table_ids[i]})
+            Document(page_content=s, metadata={id_key: table_ids[i], "type": "table"})
             for i, s in enumerate(table_summaries)
         ]
         original_table_docs = [
-            Document(page_content=t, metadata={id_key: table_ids[i]})
-            for i, t in enumerate(tables)
+            Document(page_content=json.dumps(tables[i]), metadata={id_key: table_ids[i], "type": "table"})
+            for i in range(len(tables))
         ]
-        retriever.vectorstore.add_documents(summary_tables) # Add table summaries to summary_vectorstore
-        original_text_vectorstore.add_documents(original_table_docs) # Persist original tables to original_text_vectorstore
-        retriever.docstore.mset(list(zip(table_ids, original_table_docs))) # Add original tables to InMemoryStore
+        summary_vectorstore.add_documents(summary_tables, ids=table_ids)
+        docstore.add_documents(original_table_docs, ids=table_ids)
 
+    # Store image summaries and originals (as path)
     if img_summaries:
         img_ids = [str(uuid.uuid4()) for _ in img_summaries]
-
-        # Store image summaries in the summary vectorstore
         summary_img_docs = [
-            Document(page_content=img_summaries[i], metadata={id_key: img_ids[i], "image_path": image_paths[i]})
+            Document(page_content=img_summaries[i], metadata={id_key: img_ids[i], "type": "image", "image_path": image_paths[i]})
             for i in range(len(img_summaries))
         ]
-        retriever.vectorstore.add_documents(summary_img_docs)
-
-        # Store the original image paths in the docstore for retrieval
         original_img_docs = [
-            Document(page_content=image_paths[i], metadata={id_key: img_ids[i]})
+            Document(page_content=image_paths[i], metadata={id_key: img_ids[i], "type": "image"})
             for i in range(len(image_paths))
         ]
-        retriever.docstore.mset(list(zip(img_ids, original_img_docs)))
+        summary_vectorstore.add_documents(summary_img_docs, ids=img_ids)
+        docstore.add_documents(original_img_docs, ids=img_ids)
 
-    return retriever
+    class UnifiedRetriever:
+        def __init__(self, vectorstore, docstore, id_key="doc_id"):
+            self.vectorstore = vectorstore
+            self.docstore = docstore
+            self.id_key = id_key
+            self._collection = docstore._collection
+
+        def retrieve(self, query, k=5):
+            results = self.vectorstore.similarity_search_with_score(query, k=k)
+            output = []
+            for doc, score in results:
+                doc_id = doc.metadata.get(self.id_key)
+                try:
+                    original = self._collection.get(ids=[doc_id], include=["documents", "metadatas"])
+                    original_doc = original["documents"][0] if original["documents"] else None
+                    original_meta = original["metadatas"][0] if original["metadatas"] else None
+                except Exception as e:
+                    original_doc = None
+                    original_meta = None
+                output.append({
+                    "summary": doc.page_content,
+                    "original": original_doc,
+                    "original_metadata": original_meta,
+                    "summary_metadata": doc.metadata,
+                    "score": score
+                })
+            return output
+
+    return UnifiedRetriever(summary_vectorstore, docstore, id_key)
 
 def delete_irrelevant_images(images_raw, relevant_images_to_summarize):
     """
