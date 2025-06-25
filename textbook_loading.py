@@ -15,7 +15,6 @@ from langchain.retrievers.multi_vector import MultiVectorRetriever
 from langchain.storage import InMemoryStore
 from langchain_chroma import Chroma
 from langchain_experimental.open_clip import OpenCLIPEmbeddings
-#from langchain_community.embeddings import GPT4AllEmbeddings
 from langchain_core.documents import Document
 
 class Element(BaseModel):
@@ -284,11 +283,10 @@ def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
         tuple: A tuple containing:
             - text_summaries (list): Summaries of text chunks.
             - table_summaries (list): Summaries of table contents.
-            - img_summaries (list): Summaries of relevant images.
             - image_paths (list): Paths of the relevant images.
-            - relevant_images_to_summarize (list): Element objects of images deemed relevant.
+            - relevant_images (list): Element objects of images deemed relevant.
     """
-    model = ChatOllama(model="llama3.2")
+    model = ChatOllama(model="llama3.2:3b")
 
     prompt_text_summary = "You are an assistant tasked with concisely summarizing text sections related to veterinary advice and pet care. Focus on key information, main ideas, and any actionable advice. Just give me the summary, be concise and do not be verbose. Text chunk: {element} "
     prompt_text = ChatPromptTemplate.from_template(prompt_text_summary)
@@ -321,7 +319,10 @@ def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
     text_summaries = text_summarize_chain.batch(texts, {"max_concurrency": 8})
     table_summaries = table_summarize_chain.batch(table_context_pairs, {"max_concurrency": 8})
 
-    relevant_images_to_summarize = []
+    print("Texts and Tables Summary Done!")
+
+    # Image Handling, filtering out irrelevant imgs
+    relevant_images = []
     print("Checking image relevance with local textual context...")
     for image_element in images_raw:
         image_filename = image_element.text
@@ -364,52 +365,18 @@ def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
             response_content = "no"
 
         if "yes" in response_content.lower().strip():
-            relevant_images_to_summarize.append(image_element)
+            relevant_images.append(image_element)
         else:
             print(f"Skipping irrelevant image: {image_filename}")
 
-    print(f"Number of relevant images for summarization: {len(relevant_images_to_summarize)}")
+    print(f"Number of relevant images: {len(relevant_images)}")
 
-    # Generating summaries for those relevant images.
-    img_summaries = []
-    image_paths = []
+    # Collect image paths from relevant images
+    image_paths = [img_elem.text for img_elem in relevant_images]
 
-    for img_element in relevant_images_to_summarize:
-        image_path = img_element.text
-        context = img_element.context or ""
-        if os.path.exists(image_path):
-            try:
-                with open(image_path, 'rb') as f:
-                    image_data = base64.b64encode(f.read()).decode('utf-8')
-                
-                prompt = (
-                    "From a veterinary point of view, explain what this image is about in the provided context. "
-                    "Focus on the specific actions, techniques, or procedures depicted, and relate them to the veterinary scenario described in the context. "
-                    "Be concise, use direct language, and include likely search terms based on the context.\n\n"
-                    "Avoid pleasantries"
-                    f"Context: {context}"
-                )
-                response = ollama.chat(
-                    model='minicpm-v:8b',
-                    messages=[
-                        {
-                            'role': 'user',
-                            'content': prompt,
-                            'images': [image_data]
-                        }
-                    ]
-                )
-                summary = response['message']['content']
-                img_summaries.append(summary)
-                image_paths.append(image_path)
-            except Exception as e:
-                print(f"Error summarizing image {image_path}: {e}")
-        else:
-            print(f"Image file not found for summarization: {image_path}")
+    return text_summaries, table_summaries, image_paths, relevant_images
 
-    return text_summaries, table_summaries, img_summaries, image_paths, relevant_images_to_summarize
-
-def store_in_chromadb(text_summaries, texts, table_summaries, tables, img_summaries, image_paths, persist_directory="./chroma_db"):
+def store_in_chromadb(text_summaries, texts, table_summaries, tables, image_paths, persist_directory="./chroma_db"):
     """
     Stores the summarized text, table, and image data into a ChromaDB vector store on disk.
 
@@ -418,7 +385,6 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, img_summar
         texts (list): Original text chunks (parent documents).
         table_summaries (list): Summaries of table contents.
         tables (list): Original table contents (parent documents).
-        img_summaries (list): Summaries of relevant images.
         image_paths (list): Paths of the relevant images (parent documents).
         persist_directory (str, optional): The directory where the ChromaDB collection will be persisted.
                                           Defaults to "./chroma_db".
@@ -429,8 +395,8 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, img_summar
     open_clip_embeddings = OpenCLIPEmbeddings(model_name="ViT-g-14", checkpoint="laion2b_s34b_b88k")
 
     # Vectorstore for summaries (for similarity search)
-    summary_vectorstore = Chroma(
-        collection_name="summaries",
+    vectorstore = Chroma(
+        collection_name="summaries_and_images",
         embedding_function=open_clip_embeddings,
         persist_directory=persist_directory
     )
@@ -453,7 +419,7 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, img_summar
             Document(page_content=texts[i], metadata={id_key: doc_ids[i], "type": "text"})
             for i in range(len(texts))
         ]
-        summary_vectorstore.add_documents(summary_texts, ids=doc_ids)
+        vectorstore.add_documents(summary_texts, ids=doc_ids)
         docstore.add_documents(original_text_docs, ids=doc_ids)
 
     # Store tables as JSON
@@ -467,24 +433,49 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, img_summar
             Document(page_content=json.dumps(tables[i]), metadata={id_key: table_ids[i], "type": "table"})
             for i in range(len(tables))
         ]
-        summary_vectorstore.add_documents(summary_tables, ids=table_ids)
+        vectorstore.add_documents(summary_tables, ids=table_ids)
         docstore.add_documents(original_table_docs, ids=table_ids)
 
-    # Store image summaries and originals (as path)
-    if img_summaries:
-        img_ids = [str(uuid.uuid4()) for _ in img_summaries]
-        summary_img_docs = [
-            Document(page_content=img_summaries[i], metadata={id_key: img_ids[i], "type": "image", "image_path": image_paths[i]})
-            for i in range(len(img_summaries))
-        ]
-        original_img_docs = [
-            Document(page_content=image_paths[i], metadata={id_key: img_ids[i], "type": "image"})
-            for i in range(len(image_paths))
-        ]
-        summary_vectorstore.add_documents(summary_img_docs, ids=img_ids)
-        docstore.add_documents(original_img_docs, ids=img_ids)
+    # Store images: embedding in vectorstore, original path in docstore
+    if image_paths:
+        img_ids = [str(uuid.uuid4()) for _ in image_paths]
+        image_docs = []
+        img_path_docs = []
+        for i, image_path in enumerate(image_paths):
+            if os.path.exists(image_path):
+                try:
+                    # Store the embedding in the vectorstore with metadata
+                    img_doc = Document(
+                        page_content=image_path,  
+                        metadata={
+                            id_key: img_ids[i],
+                            "type": "image",
+                            "image_path": image_path,
+                        }
+                    )
+                    image_docs.append(img_doc)
+                    # Store the image path in the docstore with metadata
+                    img_path_doc = Document(
+                        page_content = image_path,
+                        metadata={
+                            id_key : img_ids[i],
+                            'type' : "text"
+                        }
+                    )
+                    img_path_docs.append(img_path_doc)
 
-    return UnifiedRetriever(summary_vectorstore, docstore, id_key)
+                except Exception as e:
+                    print(f"Error embedding image {image_path}: {e}")
+            else:
+                print(f"Image file not found for embedding: {image_path}")
+        
+        if image_docs and img_path_docs:
+            vectorstore.add_documents(image_docs, ids=img_ids)
+            docstore.add_documents(img_path_docs, ids=img_ids)
+
+
+
+    return UnifiedRetriever(vectorstore, docstore, id_key)
 
 def delete_irrelevant_images(images_raw, relevant_images_to_summarize):
     """
