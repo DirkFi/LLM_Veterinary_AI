@@ -272,30 +272,18 @@ def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
     """
     Summarizes text, table, and relevant image elements using Ollama models.
     Also performs an image relevance check to filter out irrelevant images before summarization.
-
-    Args:
-        texts (list): List of text chunks to summarize.
-        tables (list): List of table Element objects to summarize (with context).
-        images_raw (list): List of Element objects for images with enriched context.
-        raw_pdf_elements (list, optional): All raw elements for context enrichment.
-
+    For images, both the image and its context are embedded separately for multi-modal retrieval.
+    
     Returns:
-        tuple: A tuple containing:
-            - text_summaries (list): Summaries of text chunks.
-            - table_summaries (list): Summaries of table contents.
-            - image_paths (list): Paths of the relevant images.
-            - relevant_images (list): Element objects of images deemed relevant.
+        tuple: (text_summaries, table_summaries, image_paths, relevant_images, image_contexts)
     """
     model = ChatOllama(model="llama3.2:3b")
-
     prompt_text_summary = "You are an assistant tasked with concisely summarizing text sections related to veterinary advice and pet care. Focus on key information, main ideas, and any actionable advice. Just give me the summary, be concise and do not be verbose. Text chunk: {element} "
     prompt_text = ChatPromptTemplate.from_template(prompt_text_summary)
     text_summarize_chain = {"element": lambda x: x} | prompt_text | model | StrOutputParser()
-
     # Enrich table context if not already done
     if raw_pdf_elements is not None and tables and hasattr(tables[0], 'context'):
         enrich_table_context(tables, raw_pdf_elements, window_size=1)
-
     prompt_table_summary = (
         "You are an assistant tasked with extracting key information, trends, and important numerical data from the provided table, "
         "especially as it relates to veterinary topics, animal health, or clinical practice. Use the provided context to help interpret the table. "
@@ -310,27 +298,22 @@ def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
         | model
         | StrOutputParser()
     )
-    # Prepare table-context pairs
     table_context_pairs = []
     for tbl in tables:
         context = getattr(tbl, 'context', "")
         table_context_pairs.append({"element": tbl.text if hasattr(tbl, 'text') else tbl, "context": context})
-
     text_summaries = text_summarize_chain.batch(texts, {"max_concurrency": 8})
     table_summaries = table_summarize_chain.batch(table_context_pairs, {"max_concurrency": 8})
-
     print("Texts and Tables Summary Done!")
-
     # Image Handling, filtering out irrelevant imgs
     relevant_images = []
+    image_contexts = []
     print("Checking image relevance with local textual context...")
     for image_element in images_raw:
         image_filename = image_element.text
         image_context = image_element.context
-
         if not image_context:
             image_context = "No specific text context was captured for this image, infer relevance from filename."
-
         messages_for_ollama = [
         {
             "role": "user",
@@ -346,12 +329,10 @@ def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
             "images": []
             }
         ]
-
         if os.path.exists(image_filename):
             messages_for_ollama[0]["images"].append(image_filename)
         else:
             print(f"WARNING: Image file not found: {image_filename}. Cannot pass image data to model.")
-
         response_content = "no"
         try:
             response_obj = ollama.chat(
@@ -363,51 +344,32 @@ def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
         except Exception as e:
             print(f"ERROR: Failed to invoke Ollama for image relevance check on {image_filename}: {e}")
             response_content = "no"
-
         if "yes" in response_content.lower().strip():
             relevant_images.append(image_element)
+            image_contexts.append(image_context)
         else:
             print(f"Skipping irrelevant image: {image_filename}")
-
     print(f"Number of relevant images: {len(relevant_images)}")
-
-    # Collect image paths from relevant images
     image_paths = [img_elem.text for img_elem in relevant_images]
+    return text_summaries, table_summaries, image_paths, relevant_images, image_contexts
 
-    return text_summaries, table_summaries, image_paths, relevant_images
-
-def store_in_chromadb(text_summaries, texts, table_summaries, tables, image_paths, persist_directory="./chroma_db"):
+def store_in_chromadb(text_summaries, texts, table_summaries, tables, image_paths, relevant_images=None, image_contexts=None, persist_directory="./chroma_db"):
     """
     Stores the summarized text, table, and image data into a ChromaDB vector store on disk.
-
-    Args:
-        text_summaries (list): Summaries of text chunks.
-        texts (list): Original text chunks (parent documents).
-        table_summaries (list): Summaries of table contents.
-        tables (list): Original table contents (parent documents).
-        image_paths (list): Paths of the relevant images (parent documents).
-        persist_directory (str, optional): The directory where the ChromaDB collection will be persisted.
-                                          Defaults to "./chroma_db".
-
-    Returns:
-        UnifiedRetriever: An initialized retriever object for all modalities.
+    For images, both the image and its context are embedded separately for multi-modal retrieval.
     """
     open_clip_embeddings = OpenCLIPEmbeddings(model_name="ViT-g-14", checkpoint="laion2b_s34b_b88k")
-
-    # Vectorstore for summaries (for similarity search)
     vectorstore = Chroma(
         collection_name="summaries_and_images",
         embedding_function=open_clip_embeddings,
         persist_directory=persist_directory
     )
-    # Persistent docstore for originals (all modalities)
     docstore = Chroma(
         collection_name="originals",
         embedding_function=open_clip_embeddings,
         persist_directory=persist_directory
     )
     id_key = "doc_id"
-
     # Store text chunks
     if texts:
         doc_ids = [str(uuid.uuid4()) for _ in texts]
@@ -421,7 +383,6 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, image_path
         ]
         vectorstore.add_documents(summary_texts, ids=doc_ids)
         docstore.add_documents(original_text_docs, ids=doc_ids)
-
     # Store tables as JSON
     if tables:
         table_ids = [str(uuid.uuid4()) for _ in tables]
@@ -435,46 +396,43 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, image_path
         ]
         vectorstore.add_documents(summary_tables, ids=table_ids)
         docstore.add_documents(original_table_docs, ids=table_ids)
-
-    # Store images: embedding in vectorstore, original path in docstore
-    if image_paths:
-        img_ids = [str(uuid.uuid4()) for _ in image_paths]
-        image_docs = []
-        img_path_docs = []
+    # Store images: embed both image and context separately, link by doc_id
+    if image_paths and relevant_images is not None and image_contexts is not None:
         for i, image_path in enumerate(image_paths):
             if os.path.exists(image_path):
                 try:
-                    # Store the embedding in the vectorstore with metadata
+                    doc_id = str(uuid.uuid4())
+                    # 1. Embed image (OpenCLIP will use the image file)
                     img_doc = Document(
-                        page_content=image_path,  
+                        page_content=image_path,  # This will be interpreted as an image by OpenCLIP
                         metadata={
-                            id_key: img_ids[i],
+                            id_key: doc_id,
                             "type": "image",
                             "image_path": image_path,
+                            "context": image_contexts[i],
                         }
                     )
-                    image_docs.append(img_doc)
-                    # Store the image path in the docstore with metadata
-                    img_path_doc = Document(
-                        page_content = image_path,
+                    # 2. Embed context (OpenCLIP will use the text)
+                    context_doc = Document(
+                        page_content=image_contexts[i],
                         metadata={
-                            id_key : img_ids[i],
-                            'type' : "text"
+                            id_key: doc_id + "_context",
+                            "type": "image_context",
+                            "image_path": image_path,
+                            "context": image_contexts[i],
                         }
                     )
-                    img_path_docs.append(img_path_doc)
-
+                    # Add both to vectorstore
+                    vectorstore.add_documents([img_doc], ids=[doc_id])
+                    vectorstore.add_documents([context_doc], ids=[doc_id + "_context"])
+                    # Store original image and context in docstore
+                    docstore.add_documents([
+                        Document(page_content=image_path, metadata={id_key: doc_id, "type": "image", "context": image_contexts[i]})
+                    ], ids=[doc_id])
                 except Exception as e:
-                    print(f"Error embedding image {image_path}: {e}")
+                    print(f"Error embedding image or context {image_path}: {e}")
             else:
                 print(f"Image file not found for embedding: {image_path}")
-        
-        if image_docs and img_path_docs:
-            vectorstore.add_documents(image_docs, ids=img_ids)
-            docstore.add_documents(img_path_docs, ids=img_ids)
-
-
-
     return UnifiedRetriever(vectorstore, docstore, id_key)
 
 def delete_irrelevant_images(images_raw, relevant_images_to_summarize):
