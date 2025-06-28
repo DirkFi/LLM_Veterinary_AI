@@ -16,39 +16,84 @@ from langchain.storage import InMemoryStore
 from langchain_chroma import Chroma
 from langchain_experimental.open_clip import OpenCLIPEmbeddings
 from langchain_core.documents import Document
+from sklearn.cluster import AgglomerativeClustering
+import numpy as np
 
 class Element(BaseModel):
     type: str
     text: Any
     context: Optional[str] = None
     original_index: Optional[int] = None
-class UnifiedRetriever:
-        def __init__(self, vectorstore, docstore, id_key="doc_id"):
-            self.vectorstore = vectorstore
-            self.docstore = docstore
-            self.id_key = id_key
-            self._collection = docstore._collection
 
-        def retrieve(self, query, k=5):
-            results = self.vectorstore.similarity_search_with_score(query, k=k)
-            output = []
-            for doc, score in results:
-                doc_id = doc.metadata.get(self.id_key)
-                try:
-                    original = self._collection.get(ids=[doc_id], include=["documents", "metadatas"])
-                    original_doc = original["documents"][0] if original["documents"] else None
-                    original_meta = original["metadatas"][0] if original["metadatas"] else None
-                except Exception as e:
-                    original_doc = None
-                    original_meta = None
-                output.append({
-                    "summary": doc.page_content,
-                    "original": original_doc,
-                    "original_metadata": original_meta,
-                    "summary_metadata": doc.metadata,
-                    "score": score
-                })
-            return output
+class UnifiedRetriever:
+    """
+    UnifiedRetriever supports multi-modal retrieval from the vectorstore and docstore.
+    It can retrieve by text, image, or both (multi-query), and supports metadata filtering by modality.
+    """
+    def __init__(self, vectorstore, docstore, id_key="doc_id"):
+        self.vectorstore = vectorstore
+        self.docstore = docstore
+        self.id_key = id_key
+        self._collection = docstore._collection
+
+    def retrieve(self, query, k=5, filter=None):
+        """
+        Retrieve top-k results for a query, optionally filtered by metadata (e.g., modality).
+        """
+        results = self.vectorstore.similarity_search_with_score(query, k=k, filter=filter)
+        output = []
+        for doc, score in results:
+            doc_id = doc.metadata.get(self.id_key)
+            try:
+                original = self._collection.get(ids=[doc_id], include=["documents", "metadatas"])
+                original_doc = original["documents"][0] if original["documents"] else None
+                original_meta = original["metadatas"][0] if original["metadatas"] else None
+            except Exception as e:
+                original_doc = None
+                original_meta = None
+            output.append({
+                "summary": doc.page_content,
+                "original": original_doc,
+                "original_metadata": original_meta,
+                "summary_metadata": doc.metadata,
+                "score": score
+            })
+        return output
+
+    def retrieve_multi_modal(self, query, k=5, text_types=("text",), image_types=("image", "image_summary")):
+        """
+        Multi-Query/Multi-Modal Retrieval:
+        - Retrieves top-k text and top-k image/image_summary results for the query.
+        - Merges and sorts by score.
+        - Returns a list of results with modality info.
+        """
+        # Retrieve text results
+        text_results = self.vectorstore.similarity_search_with_score(query, k=k, filter={"type": {"$in": list(text_types)}})
+        # Retrieve image/image_summary results
+        image_results = self.vectorstore.similarity_search_with_score(query, k=k, filter={"type": {"$in": list(image_types)}})
+        # Merge and sort by score (lower is better if using distance, higher is better if using similarity)
+        all_results = []
+        for doc, score in text_results:
+            doc_id = doc.metadata.get(self.id_key)
+            all_results.append({
+                "modality": doc.metadata.get("type"),
+                "summary": doc.page_content,
+                "original_metadata": doc.metadata,
+                "score": score,
+                "doc_id": doc_id
+            })
+        for doc, score in image_results:
+            doc_id = doc.metadata.get(self.id_key)
+            all_results.append({
+                "modality": doc.metadata.get("type"),
+                "summary": doc.page_content,
+                "original_metadata": doc.metadata,
+                "score": score,
+                "doc_id": doc_id
+            })
+        # Sort by score (descending if similarity, ascending if distance)
+        all_results.sort(key=lambda x: x["score"], reverse=True)
+        return all_results
 
 def load_book(file_name, image_output_dir="./figures"):
     """
@@ -74,6 +119,93 @@ def load_book(file_name, image_output_dir="./figures"):
         extract_image_block_output_dir=image_output_dir,
     )
     return raw_pdf_elements
+
+def is_junk_text(text):
+    t = text.strip()
+    if not t or len(t) < 5:
+        return True
+    junk_patterns = [
+        r'^—o—$', r'^\*+$', r'^_+$', r'^page \d+', r'^\d{1,2}/\d{1,2}/\d{2,4}$',
+        r"^cat owner[’']?s home veterinary handbook$", r'^\d+$', r'^ch\d+', r'^fig(ure)?[-\d]+',
+        r'^04_095300.*page.*$', r'^[\W_]+$'
+    ]
+    for pat in junk_patterns:
+        if re.match(pat, t, re.IGNORECASE):
+            return True
+    # If mostly non-alphabetic
+    if len(t) > 0 and sum(c.isalpha() for c in t) < 0.3 * len(t):
+        return True
+    return False
+
+def semantic_chunk_texts(texts, embedding_model, n_clusters=30):
+    """
+    Semantically chunk the cleaned text into coherent groups using embeddings and clustering.
+    Returns a list of merged, semantically coherent text chunks.
+    """
+    if len(texts) == 0:
+        return []
+    embeddings = embedding_model.embed_documents(texts)
+    embeddings = np.array(embeddings)
+    n_clusters = min(n_clusters, len(texts))
+    if n_clusters < 2:
+        return texts
+    clustering = AgglomerativeClustering(n_clusters=n_clusters)
+    labels = clustering.fit_predict(embeddings)
+    clusters = {}
+    for idx, label in enumerate(labels):
+        clusters.setdefault(label, []).append(texts[idx])
+    semantic_chunks = ['\n'.join(cluster) for cluster in clusters.values()]
+    return semantic_chunks
+
+def enrich_image_context(images, all_raw_elements, window_size=1, embedding_model=None, semantic_chunks=None):
+    """
+    Enriches the context for each image using a hybrid approach:
+    1. Prefer figure caption if available.
+    2. Otherwise, use the preceding paragraph within the same section.
+    3. Fallback: use the most semantically similar chunk (if embedding_model and semantic_chunks are provided).
+    """
+    # Build a map of figure captions by index
+    caption_map = {e.original_index: e.text for e in all_raw_elements if hasattr(e, 'type') and e.type == 'figure_caption'}
+    # Build a list of section boundaries (titles)
+    section_indices = [i for i, e in enumerate(all_raw_elements) if hasattr(e, 'type') and e.type == 'title']
+    for img_element in images:
+        img_index = img_element.original_index
+        if img_index is None:
+            continue
+        # 1. Prefer figure caption
+        if img_index in caption_map:
+            img_element.context = caption_map[img_index]
+            continue
+        # 2. Use preceding paragraph within the same section
+        section_start = 0
+        for idx in section_indices:
+            if idx < img_index:
+                section_start = idx
+            else:
+                break
+        preceding_paragraph = None
+        for j in range(img_index - 1, section_start - 1, -1):
+            e = all_raw_elements[j]
+            if hasattr(e, 'type') and e.type in ['text', 'narrative_text', 'list_item']:
+                t = e.text.strip() if hasattr(e, 'text') else str(e).strip()
+                if t and not is_junk_text(t):
+                    preceding_paragraph = t
+                    break
+        if preceding_paragraph:
+            img_element.context = preceding_paragraph
+            continue
+        # 3. Fallback: semantic similarity
+        if embedding_model is not None and semantic_chunks is not None and len(semantic_chunks) > 0:
+            img_query = img_element.text
+            chunk_embeddings = embedding_model.embed_documents(semantic_chunks)
+            img_embedding = embedding_model.embed_query(img_query)
+            sims = np.dot(chunk_embeddings, img_embedding) / (
+                np.linalg.norm(chunk_embeddings, axis=1) * np.linalg.norm(img_embedding) + 1e-8
+            )
+            best_idx = int(np.argmax(sims))
+            img_element.context = semantic_chunks[best_idx]
+        else:
+            img_element.context = "No specific text context available around this image."
 
 def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=20, window_size=1):
     """
@@ -110,8 +242,9 @@ def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=2
 
     def finalize_text_block_inner():
         nonlocal current_text_block, current_context_prefix
-        if current_text_block.strip() and len(current_text_block.strip()) >= min_meaningful_text_length:
-            text_for_semantic_chunking.append(Element(type="text", text=current_text_block.strip()))
+        cleaned = current_text_block.strip()
+        if cleaned and len(cleaned) >= min_meaningful_text_length and not is_junk_text(cleaned):
+            text_for_semantic_chunking.append(Element(type="text", text=cleaned))
         current_text_block = ""
 
     for i, element in enumerate(raw_pdf_elements):
@@ -132,12 +265,13 @@ def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=2
             ):
                 is_running_header = True
 
-            if not is_running_header:
+            if not is_running_header and not is_junk_text(element_text):
                 current_context_prefix = element_text + " "
             headers_raw.append(Element(type="header", text=element_text, original_index=i))
         elif "unstructured.documents.elements.Title" in element_type_str:
             finalize_text_block_inner()
-            current_context_prefix = element_text + " "
+            if not is_junk_text(element_text):
+                current_context_prefix = element_text + " "
             titles_raw.append(Element(type="title", text=element_text, original_index=i))
         elif "unstructured.documents.elements.NarrativeText" in element_type_str or \
              "unstructured.documents.elements.ListItem" in element_type_str or \
@@ -150,12 +284,13 @@ def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=2
                 current_text_block += current_context_prefix
                 
             current_text_block += element_text + " "
-            if "unstructured.documents.elements.ListItem" in element_type_str:
+            if "unstructured.documents.elements.ListItem" in element_type_str and not is_junk_text(element_text):
                 list_items_raw.append(Element(type="list_item", text=element_text, original_index=i))
 
         elif "unstructured.documents.elements.Table" in element_type_str:
             finalize_text_block_inner()
-            tables_raw.append(Element(type="table", text=element_text, original_index=i))
+            if not is_junk_text(element_text):
+                tables_raw.append(Element(type="table", text=element_text, original_index=i))
         elif "unstructured.documents.elements.Image" in element_type_str:
             finalize_text_block_inner()
 
@@ -165,9 +300,11 @@ def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=2
 
         elif "unstructured.documents.elements.FigureCaption" in element_type_str:
             finalize_text_block_inner()
-            figure_captions_raw.append(Element(type="figure_caption", text=element_text, original_index=i))
+            if not is_junk_text(element_text):
+                figure_captions_raw.append(Element(type="figure_caption", text=element_text, original_index=i))
         elif "unstructured.documents.elements.Footer" in element_type_str:
-            footers_raw.append(Element(type="footer", text=element_text, original_index=i))
+            if not is_junk_text(element_text):
+                footers_raw.append(Element(type="footer", text=element_text, original_index=i))
 
     finalize_text_block_inner()
 
@@ -177,55 +314,6 @@ def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=2
     tables = [e.text for e in tables_raw]
     
     return texts, tables, images_raw, headers_raw, titles_raw, footers_raw, figure_captions_raw, list_items_raw
-
-def enrich_image_context(images, all_raw_elements, window_size=1):
-    """
-    Enriches the context for each image by looking at a window of surrounding text and captions.
-
-    Args:
-        images (list): A list of image Element objects to enrich.
-        all_raw_elements (list): All raw elements from the PDF, used to find surrounding text.
-        window_size (int, optional): Number of elements to look before and after the image. Defaults to 3.
-    """
-    for img_element in images:
-        img_index = img_element.original_index
-        if img_index is None:
-            continue
-
-        start_index = max(0, img_index - window_size)
-        end_index = min(len(all_raw_elements), img_index + window_size + 1)
-        
-        surrounding_text_elements = []
-        for j in range(start_index, end_index):
-            surrounding_element = all_raw_elements[j]
-            element_type_str = str(type(surrounding_element))
-            element_text = str(surrounding_element).strip()
-
-            if "unstructured.documents.elements.NarrativeText" in element_type_str or \
-               "unstructured.documents.elements.ListItem" in element_type_str or \
-               "unstructured.documents.elements.Text" in element_type_str or \
-               "unstructured.documents.elements.FigureCaption" in element_type_str:
-                
-                if len(element_text) >= 5 or any(char.isalpha() for char in element_text):
-                     surrounding_text_elements.append(element_text)
-            
-            if "unstructured.documents.elements.Header" in element_type_str or \
-               "unstructured.documents.elements.Title" in element_type_str:
-                lower_element_text = element_text.lower()
-                is_running_header = (
-                    "qxp" in lower_element_text or "pm" in lower_element_text or
-                    "am" in lower_element_text or "page" in lower_element_text or
-                    re.search(r'\\d{1,2}/\\d{1,2}/\\d{2,4}', lower_element_text)
-                )
-                if not is_running_header:
-                    surrounding_text_elements.append(element_text)
-
-
-        enriched_context = " ".join(surrounding_text_elements).strip()
-        if not enriched_context:
-            enriched_context = "No specific text context available around this image."
-        
-        img_element.context = enriched_context
 
 def enrich_table_context(tables, all_raw_elements, window_size=1):
     """
@@ -272,10 +360,10 @@ def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
     """
     Summarizes text, table, and relevant image elements using Ollama models.
     Also performs an image relevance check to filter out irrelevant images before summarization.
-    For images, both the image and its context are embedded separately for multi-modal retrieval.
+    For images, both the image and its LLM-generated summary are embedded separately for multi-modal retrieval.
     
     Returns:
-        tuple: (text_summaries, table_summaries, image_paths, relevant_images, image_contexts)
+        tuple: (text_summaries, table_summaries, image_paths, relevant_images, image_summaries)
     """
     model = ChatOllama(model="llama3.2:3b")
     prompt_text_summary = "You are an assistant tasked with concisely summarizing text sections related to veterinary advice and pet care. Focus on key information, main ideas, and any actionable advice. Just give me the summary, be concise and do not be verbose. Text chunk: {element} "
@@ -307,7 +395,7 @@ def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
     print("Texts and Tables Summary Done!")
     # Image Handling, filtering out irrelevant imgs
     relevant_images = []
-    image_contexts = []
+    image_summaries = []
     print("Checking image relevance with local textual context...")
     for image_element in images_raw:
         image_filename = image_element.text
@@ -346,17 +434,47 @@ def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
             response_content = "no"
         if "yes" in response_content.lower().strip():
             relevant_images.append(image_element)
-            image_contexts.append(image_context)
         else:
             print(f"Skipping irrelevant image: {image_filename}")
     print(f"Number of relevant images: {len(relevant_images)}")
     image_paths = [img_elem.text for img_elem in relevant_images]
-    return text_summaries, table_summaries, image_paths, relevant_images, image_contexts
+    # Generate LLM summaries for each relevant image
+    print("Generating LLM summaries for relevant images...")
+    for img_elem in relevant_images:
+        image_filename = img_elem.text
+        image_context = img_elem.context or "No specific text context was captured for this image."
+        # Compose a prompt for the LLM to summarize the image using both the image and its context
+        img_summary_prompt = (
+            "You are a veterinary assistant AI. Given the following image and its local text context, "
+            "write a concise, factual summary of what is depicted in the image, focusing on veterinary relevance. "
+            "If the image shows a procedure, anatomy, or a specific condition, describe it clearly. "
+            "If the context provides extra clues, use them.\n\n"
+            f"Local Text Context: {image_context}\n"
+            f"Image Filename: {os.path.basename(image_filename)}\n"
+            "Image summary:"
+        )
+        img_messages = [{
+            "role": "user",
+            "content": img_summary_prompt,
+            "images": [image_filename] if os.path.exists(image_filename) else []
+        }]
+        try:
+            img_summary_response = ollama.chat(
+                model="minicpm-v:8b",
+                messages=img_messages,
+                options={"temperature": 0.2}
+            )
+            img_summary = img_summary_response['message']['content'].strip()
+        except Exception as e:
+            print(f"ERROR: Failed to summarize image {image_filename}: {e}")
+            img_summary = image_context  # fallback to context
+        image_summaries.append(img_summary)
+    return text_summaries, table_summaries, image_paths, relevant_images, image_summaries
 
-def store_in_chromadb(text_summaries, texts, table_summaries, tables, image_paths, relevant_images=None, image_contexts=None, persist_directory="./chroma_db"):
+def store_in_chromadb(text_summaries, texts, table_summaries, tables, image_paths, relevant_images=None, image_summaries=None, persist_directory="./chroma_db"):
     """
     Stores the summarized text, table, and image data into a ChromaDB vector store on disk.
-    For images, both the image and its context are embedded separately for multi-modal retrieval.
+    For images, both the image and its LLM-generated summary are embedded separately for multi-modal retrieval.
     """
     open_clip_embeddings = OpenCLIPEmbeddings(model_name="ViT-g-14", checkpoint="laion2b_s34b_b88k")
     vectorstore = Chroma(
@@ -396,8 +514,8 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, image_path
         ]
         vectorstore.add_documents(summary_tables, ids=table_ids)
         docstore.add_documents(original_table_docs, ids=table_ids)
-    # Store images: embed both image and context separately, link by doc_id
-    if image_paths and relevant_images is not None and image_contexts is not None:
+    # Store images: embed both image and LLM summary separately, link by doc_id
+    if image_paths and relevant_images is not None and image_summaries is not None:
         for i, image_path in enumerate(image_paths):
             if os.path.exists(image_path):
                 try:
@@ -409,28 +527,28 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, image_path
                             id_key: doc_id,
                             "type": "image",
                             "image_path": image_path,
-                            "context": image_contexts[i],
+                            "summary": image_summaries[i],
                         }
                     )
-                    # 2. Embed context (OpenCLIP will use the text)
-                    context_doc = Document(
-                        page_content=image_contexts[i],
+                    # 2. Embed LLM summary (OpenCLIP will use the text)
+                    summary_doc = Document(
+                        page_content=image_summaries[i],
                         metadata={
                             id_key: doc_id + "_context",
-                            "type": "image_context",
+                            "type": "image_summary",
                             "image_path": image_path,
-                            "context": image_contexts[i],
+                            "summary": image_summaries[i],
                         }
                     )
                     # Add both to vectorstore
                     vectorstore.add_documents([img_doc], ids=[doc_id])
-                    vectorstore.add_documents([context_doc], ids=[doc_id + "_context"])
-                    # Store original image and context in docstore
+                    vectorstore.add_documents([summary_doc], ids=[doc_id + "_context"])
+                    # Store original image and summary in docstore
                     docstore.add_documents([
-                        Document(page_content=image_path, metadata={id_key: doc_id, "type": "image", "context": image_contexts[i]})
+                        Document(page_content=image_path, metadata={id_key: doc_id, "type": "image", "summary": image_summaries[i]})
                     ], ids=[doc_id])
                 except Exception as e:
-                    print(f"Error embedding image or context {image_path}: {e}")
+                    print(f"Error embedding image or summary {image_path}: {e}")
             else:
                 print(f"Image file not found for embedding: {image_path}")
     return UnifiedRetriever(vectorstore, docstore, id_key)
@@ -458,7 +576,6 @@ def delete_irrelevant_images(images_raw, relevant_images_to_summarize):
             else:
                 print(f"Skipping deletion: Image file not found at {image_path}")
     print(f"Finished deleting images. Total deleted: {images_deleted_count}")
-
 
 
 
