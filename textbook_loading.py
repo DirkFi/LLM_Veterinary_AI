@@ -7,6 +7,7 @@ import uuid
 import base64
 import ollama
 import json
+from PIL import Image
 
 from langchain_ollama import ChatOllama
 from langchain_core.output_parsers import StrOutputParser
@@ -137,77 +138,54 @@ def is_junk_text(text):
         return True
     return False
 
-def semantic_chunk_texts(texts, embedding_model, n_clusters=30):
+def enrich_image_context(images_raw, raw_pdf_elements, window_size=2):
     """
-    Semantically chunk the cleaned text into coherent groups using embeddings and clustering.
-    Returns a list of merged, semantically coherent text chunks.
+    Assigns high-quality, boundary-aware context to each image in images_raw.
+    - Looks at a window of elements before and after the image.
+    - Stops at Title or Header (section/chapter boundary).
+    - Prioritizes FigureCaption if present.
+    - Skips headers, footers, and junk text.
+    - Prefers preceding context if the image is at a boundary.
     """
-    if len(texts) == 0:
-        return []
-    embeddings = embedding_model.embed_documents(texts)
-    embeddings = np.array(embeddings)
-    n_clusters = min(n_clusters, len(texts))
-    if n_clusters < 2:
-        return texts
-    clustering = AgglomerativeClustering(n_clusters=n_clusters)
-    labels = clustering.fit_predict(embeddings)
-    clusters = {}
-    for idx, label in enumerate(labels):
-        clusters.setdefault(label, []).append(texts[idx])
-    semantic_chunks = ['\n'.join(cluster) for cluster in clusters.values()]
-    return semantic_chunks
-
-def enrich_image_context(images, all_raw_elements, window_size=1, embedding_model=None, semantic_chunks=None):
-    """
-    Enriches the context for each image using a hybrid approach:
-    1. Prefer figure caption if available.
-    2. Otherwise, use the preceding paragraph within the same section.
-    3. Fallback: use the most semantically similar chunk (if embedding_model and semantic_chunks are provided).
-    """
-    # Build a map of figure captions by index
-    caption_map = {e.original_index: e.text for e in all_raw_elements if hasattr(e, 'type') and e.type == 'figure_caption'}
-    # Build a list of section boundaries (titles)
-    section_indices = [i for i, e in enumerate(all_raw_elements) if hasattr(e, 'type') and e.type == 'title']
-    for img_element in images:
-        img_index = img_element.original_index
-        if img_index is None:
+    for img_elem in images_raw:
+        idx = img_elem.original_index
+        if idx is None:
             continue
-        # 1. Prefer figure caption
-        if img_index in caption_map:
-            img_element.context = caption_map[img_index]
-            continue
-        # 2. Use preceding paragraph within the same section
-        section_start = 0
-        for idx in section_indices:
-            if idx < img_index:
-                section_start = idx
-            else:
+        context_texts = []
+        found_caption = None
+        # Look backwards for context
+        for j in range(idx-1, max(-1, idx-window_size-1), -1):
+            el = raw_pdf_elements[j]
+            el_type = str(type(el))
+            el_text = str(el).strip()
+            if "Title" in el_type or "Header" in el_type:
+                break  # Stop at section/chapter boundary
+            if "FigureCaption" in el_type and not is_junk_text(el_text):
+                found_caption = el_text
+                break  # Use caption as main context
+            if ("NarrativeText" in el_type or "ListItem" in el_type or "Text" in el_type) and not is_junk_text(el_text):
+                context_texts.insert(0, el_text)  # Prepend
+        # Look forwards for context, but stop at Title/Header
+        for j in range(idx+1, min(len(raw_pdf_elements), idx+window_size+1)):
+            el = raw_pdf_elements[j]
+            el_type = str(type(el))
+            el_text = str(el).strip()
+            if "Title" in el_type or "Header" in el_type:
                 break
-        preceding_paragraph = None
-        for j in range(img_index - 1, section_start - 1, -1):
-            e = all_raw_elements[j]
-            if hasattr(e, 'type') and e.type in ['text', 'narrative_text', 'list_item']:
-                t = e.text.strip() if hasattr(e, 'text') else str(e).strip()
-                if t and not is_junk_text(t):
-                    preceding_paragraph = t
-                    break
-        if preceding_paragraph:
-            img_element.context = preceding_paragraph
-            continue
-        # 3. Fallback: semantic similarity
-        if embedding_model is not None and semantic_chunks is not None and len(semantic_chunks) > 0:
-            img_query = img_element.text
-            chunk_embeddings = embedding_model.embed_documents(semantic_chunks)
-            img_embedding = embedding_model.embed_query(img_query)
-            sims = np.dot(chunk_embeddings, img_embedding) / (
-                np.linalg.norm(chunk_embeddings, axis=1) * np.linalg.norm(img_embedding) + 1e-8
-            )
-            best_idx = int(np.argmax(sims))
-            img_element.context = semantic_chunks[best_idx]
+            if "FigureCaption" in el_type and not is_junk_text(el_text):
+                found_caption = el_text
+                break
+            if ("NarrativeText" in el_type or "ListItem" in el_type or "Text" in el_type) and not is_junk_text(el_text):
+                context_texts.append(el_text)
+        # Assign context
+        if found_caption:
+            img_elem.context = found_caption
+        elif context_texts:
+            img_elem.context = " ".join(context_texts)
         else:
-            img_element.context = "No specific text context available around this image."
+            img_elem.context = "No specific text context available around this image."
 
-def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=20, window_size=1):
+def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=15, window_size=1):
     """
     Cleans and categorizes raw PDF elements into texts, tables, and images.
     Also enriches image contexts by looking at surrounding text.
@@ -240,11 +218,11 @@ def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=2
     current_text_block = ""
     current_context_prefix = ""
 
-    def finalize_text_block_inner():
+    def finalize_text_block_inner(last_index=None):
         nonlocal current_text_block, current_context_prefix
         cleaned = current_text_block.strip()
         if cleaned and len(cleaned) >= min_meaningful_text_length and not is_junk_text(cleaned):
-            text_for_semantic_chunking.append(Element(type="text", text=cleaned))
+            text_for_semantic_chunking.append(Element(type="text", text=cleaned, original_index=last_index))
         current_text_block = ""
 
     for i, element in enumerate(raw_pdf_elements):
@@ -252,7 +230,7 @@ def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=2
         element_text = str(element).strip()
 
         if "unstructured.documents.elements.Header" in element_type_str:
-            finalize_text_block_inner()
+            finalize_text_block_inner(i)
             
             is_running_header = False
             lower_element_text = element_text.lower()
@@ -269,7 +247,7 @@ def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=2
                 current_context_prefix = element_text + " "
             headers_raw.append(Element(type="header", text=element_text, original_index=i))
         elif "unstructured.documents.elements.Title" in element_type_str:
-            finalize_text_block_inner()
+            finalize_text_block_inner(i)
             if not is_junk_text(element_text):
                 current_context_prefix = element_text + " "
             titles_raw.append(Element(type="title", text=element_text, original_index=i))
@@ -288,32 +266,51 @@ def clean_and_categorize_elements(raw_pdf_elements, min_meaningful_text_length=2
                 list_items_raw.append(Element(type="list_item", text=element_text, original_index=i))
 
         elif "unstructured.documents.elements.Table" in element_type_str:
-            finalize_text_block_inner()
+            finalize_text_block_inner(i)
             if not is_junk_text(element_text):
                 tables_raw.append(Element(type="table", text=element_text, original_index=i))
         elif "unstructured.documents.elements.Image" in element_type_str:
-            finalize_text_block_inner()
+            finalize_text_block_inner(i)
 
             image_path = getattr(element.metadata, "image_path", "N/A")
             images_raw.append(Element(type="image", text=image_path, context="", original_index=i))
             current_text_block = ""
 
         elif "unstructured.documents.elements.FigureCaption" in element_type_str:
-            finalize_text_block_inner()
+            finalize_text_block_inner(i)
             if not is_junk_text(element_text):
                 figure_captions_raw.append(Element(type="figure_caption", text=element_text, original_index=i))
         elif "unstructured.documents.elements.Footer" in element_type_str:
             if not is_junk_text(element_text):
                 footers_raw.append(Element(type="footer", text=element_text, original_index=i))
 
-    finalize_text_block_inner()
-
+    finalize_text_block_inner(i)
+    # Enrich image context with boundary-aware logic
     enrich_image_context(images_raw, raw_pdf_elements, window_size=window_size)
-
-    texts = [e.text for e in text_for_semantic_chunking]
-    tables = [e.text for e in tables_raw]
+    texts = text_for_semantic_chunking
+    tables = tables_raw
     
     return texts, tables, images_raw, headers_raw, titles_raw, footers_raw, figure_captions_raw, list_items_raw
+
+def semantic_chunk_texts(texts, embedding_model, n_clusters=30):
+    """
+    Semantically chunk the cleaned text into coherent groups using embeddings and clustering.
+    Returns a list of merged, semantically coherent text chunks.
+    """
+    if len(texts) == 0:
+        return []
+    embeddings = embedding_model.embed_documents(texts)
+    embeddings = np.array(embeddings)
+    n_clusters = min(n_clusters, len(texts))
+    if n_clusters < 2:
+        return texts
+    clustering = AgglomerativeClustering(n_clusters=n_clusters)
+    labels = clustering.fit_predict(embeddings)
+    clusters = {}
+    for idx, label in enumerate(labels):
+        clusters.setdefault(label, []).append(texts[idx])
+    semantic_chunks = ['\n'.join(cluster) for cluster in clusters.values()]
+    return semantic_chunks
 
 def enrich_table_context(tables, all_raw_elements, window_size=1):
     """
@@ -356,6 +353,25 @@ def enrich_table_context(tables, all_raw_elements, window_size=1):
             enriched_context = "No specific text context available around this table."
         tbl_element.context = enriched_context
 
+def is_decorative_image(image_path, min_area=500, extreme_ratio=8):
+    """
+    Returns True if the image is likely a divider/decorative element.
+    - min_area: images smaller than this (in pixels) are likely not informative.
+    - extreme_ratio: if width/height or height/width exceeds this, likely a divider.
+    """
+    try:
+        with Image.open(image_path) as img:
+            w, h = img.size
+            area = w * h
+            if area < min_area:
+                return True
+            ratio = max(w/h, h/w)
+            if ratio > extreme_ratio:
+                return True
+    except Exception:
+        pass
+    return False
+
 def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
     """
     Summarizes text, table, and relevant image elements using Ollama models.
@@ -393,6 +409,7 @@ def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
     text_summaries = text_summarize_chain.batch(texts, {"max_concurrency": 8})
     table_summaries = table_summarize_chain.batch(table_context_pairs, {"max_concurrency": 8})
     print("Texts and Tables Summary Done!")
+    
     # Image Handling, filtering out irrelevant imgs
     relevant_images = []
     image_summaries = []
@@ -400,19 +417,21 @@ def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
     for image_element in images_raw:
         image_filename = image_element.text
         image_context = image_element.context
+        # Decorative image filtering
+        if is_decorative_image(image_filename):
+            print(f"Skipping decorative image: {image_filename}")
+            continue
         if not image_context:
             image_context = "No specific text context was captured for this image, infer relevance from filename."
         messages_for_ollama = [
         {
             "role": "user",
             "content": (
-                "You are a veterinary assistant helping to filter images for a veterinary knowledge base. "
-                "Given the following local textual context and the image filename, decide if the image is relevant to veterinary topics, animal care, or pet health. "
-                "If the context is clearly nonsense, random symbols, or not related to veterinary medicine (e.g., '--o--', '*92312*))____++', or similar gibberish), respond with 'no'. "
-                "If the image and context are relevant to veterinary topics, respond with 'yes'. "
+                "You are a veterinary assistant helping to filter images for a veterinary knowledge base.\n"
+                "Given the following local textual context and the image, answer with 'yes' if the image is a real photograph, diagram, or illustration relevant to veterinary medicine, animal care, or pet health.\n"
+                "If the image is a decorative divider, border, simple geometric shape, or contains no meaningful content, answer with 'no'.\n"
                 "Only respond with 'yes' or 'no'.\n\n"
                 f"Local Textual Context: {image_context}\n"
-                f"Image Filename: {os.path.basename(image_filename)}"
             ),
             "images": []
             }
@@ -446,8 +465,9 @@ def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
         # Compose a prompt for the LLM to summarize the image using both the image and its context
         img_summary_prompt = (
             "You are a veterinary assistant AI. Given the following image and its local text context, "
-            "write a concise, factual summary of what is depicted in the image, focusing on veterinary relevance. "
-            "If the image shows a procedure, anatomy, or a specific condition, describe it clearly. "
+            "write a concise, factual summary of what is depicted in the image, focusing on veterinary relevance.\n"
+            "If the image is a decorative divider, border, or contains no meaningful content, respond with: 'This image is a decorative or non-informative element and does not contain veterinary-relevant content.'\n"
+            "If the image shows a procedure, anatomy, or a specific condition, describe it clearly.\n"
             "If the context provides extra clues, use them.\n\n"
             f"Local Text Context: {image_context}\n"
             f"Image Filename: {os.path.basename(image_filename)}\n"
@@ -496,7 +516,7 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, image_path
             for i, s in enumerate(text_summaries)
         ]
         original_text_docs = [
-            Document(page_content=texts[i], metadata={id_key: doc_ids[i], "type": "text"})
+            Document(page_content=texts[i].text, metadata={id_key: doc_ids[i], "type": "text"})
             for i in range(len(texts))
         ]
         vectorstore.add_documents(summary_texts, ids=doc_ids)
@@ -509,7 +529,7 @@ def store_in_chromadb(text_summaries, texts, table_summaries, tables, image_path
             for i, s in enumerate(table_summaries)
         ]
         original_table_docs = [
-            Document(page_content=json.dumps(tables[i]), metadata={id_key: table_ids[i], "type": "table"})
+            Document(page_content=json.dumps(tables[i].dict()), metadata={id_key: table_ids[i], "type": "table"})
             for i in range(len(tables))
         ]
         vectorstore.add_documents(summary_tables, ids=table_ids)
@@ -576,7 +596,6 @@ def delete_irrelevant_images(images_raw, relevant_images_to_summarize):
             else:
                 print(f"Skipping deletion: Image file not found at {image_path}")
     print(f"Finished deleting images. Total deleted: {images_deleted_count}")
-
 
 
 
