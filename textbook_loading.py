@@ -353,7 +353,7 @@ def enrich_table_context(tables, all_raw_elements, window_size=1):
             enriched_context = "No specific text context available around this table."
         tbl_element.context = enriched_context
 
-def is_decorative_image(image_path, min_area=500, extreme_ratio=8):
+def is_decorative_image(image_path, min_area=500, extreme_ratio=3.6):
     """
     Returns True if the image is likely a divider/decorative element.
     - min_area: images smaller than this (in pixels) are likely not informative.
@@ -424,17 +424,17 @@ def summarize_elements(texts, tables, images_raw, raw_pdf_elements=None):
         if not image_context:
             image_context = "No specific text context was captured for this image, infer relevance from filename."
         messages_for_ollama = [
-        {
+            {
             "role": "user",
             "content": (
-                "You are a veterinary assistant helping to filter images for a veterinary knowledge base.\n"
-                "Given the following local textual context and the image, answer with 'yes' if the image is a real photograph, diagram, or illustration relevant to veterinary medicine, animal care, or pet health.\n"
-                "If the image is a decorative divider, border, simple geometric shape, or contains no meaningful content, answer with 'no'.\n"
+                "You are a veterinary assistant helping to build a knowledge base.\n"
+                "Only respond with 'yes' if the image clearly depicts something veterinary-relevant, such as an animal, animal anatomy, veterinary medical procedure, parasite, or disease.\n"
+                "If the image is decorative, a divider, a geometric shape, or you are unsure, respond with 'no'.\n"
                 "Only respond with 'yes' or 'no'.\n\n"
                 f"Local Textual Context: {image_context}\n"
             ),
-            "images": []
-            }
+            "images": [image_filename] if os.path.exists(image_filename) else []
+         }
         ]
         if os.path.exists(image_filename):
             messages_for_ollama[0]["images"].append(image_filename)
