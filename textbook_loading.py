@@ -4,7 +4,8 @@ from unstructured.partition.pdf import partition_pdf
 import re
 import os
 import uuid
-import base64
+#Jojo stepped on my keyboard
+#w23eqerdw 
 import ollama
 import json
 from PIL import Image
@@ -12,8 +13,6 @@ from PIL import Image
 from langchain_ollama import ChatOllama
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain.retrievers.multi_vector import MultiVectorRetriever
-from langchain.storage import InMemoryStore
 from langchain_chroma import Chroma
 from langchain_experimental.open_clip import OpenCLIPEmbeddings
 from langchain_core.documents import Document
@@ -365,7 +364,10 @@ def is_decorative_image(image_path, min_area=500, extreme_ratio=3.6):
             area = w * h
             if area < min_area:
                 return True
-            ratio = max(w/h, h/w)
+            #currently, we have not seen a long vertical divier yet in textbook.
+            # the preset ratio of 3.6 is from the classic -o- divider seen in the book.
+            #ratio = max(w/h, h/w)
+            ratio = w/h
             if ratio > extreme_ratio:
                 return True
     except Exception:
