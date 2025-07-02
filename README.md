@@ -1,80 +1,55 @@
-# 🐾 Veterinary Textbook RAG Pipeline
+# 🐾 Veterinary Textbook Multimodal RAG Pipeline
 
-This project is a Retrieval-Augmented Generation (RAG) pipeline for veterinary textbooks. It enables semantic search and retrieval over both text and images, allowing users to query for veterinary advice, procedures, and visual references using natural language.
+This project implements a modern Retrieval-Augmented Generation (RAG) pipeline for veterinary textbooks, supporting both text and images. It enables semantic search and retrieval over multimodal content, allowing users to query for veterinary advice, procedures, and visual references using natural language.
 
-## Features
+## Pipeline Overview
 
-- **PDF Ingestion:** Partition and extract text, tables, and images from veterinary textbooks.
-- **Contextual Chunking:** Text and images are chunked and enriched with surrounding context for better retrieval.
-- **Image Summarization:** Images are summarized using a vision-language model, with summaries tied to their local text context.
-- **Multimodal Embeddings:** Both text and image summaries are embedded into a shared vector space using OpenCLIP, enabling cross-modal retrieval.
-- **Semantic Search:** Users can search using natural language and retrieve relevant text, tables, and images.
-- **Original Content Retrieval:** Each summary is linked to its original full text, table, or image for detailed reference.
-- **Irrelevant Image Filtering:** Only images relevant to veterinary content are kept and summarized.
+### 1. Ingestion & Vector Database Construction
+- **Raw Extraction:**
+  - PDFs are parsed to extract all elements: text blocks, tables, and images (with their local context).
+- **Cleaning & Chunking:**
+  - Text is cleaned, junk/irrelevant content is filtered, and semantically chunked for optimal retrieval.
+  - Images are assigned context using a hybrid of captions, local paragraphs, and semantic similarity.
+- **Image Summarization:**
+  - Each image is summarized using a vision-language model (VLM), with summaries enriched by local context.
+- **Multimodal Embedding:**
+  - Both text chunks and image summaries are embedded into a shared vector space using OpenCLIP.
+- **Storage:**
+  - All summaries (text, table, image) and their metadata are stored in a ChromaDB vector database.
+  - Each summary links to its original content (full text, table, or image path) for reference.
 
-## How It Works
+### 2. Query Handling with LangGraph
+- **User Query Intake:**
+  - User submits a natural language query (optionally with an image).
+- **Graph-based Processing:**
+  - The query is routed through a LangGraph workflow:
+    - **Domain Classification:** Determines if the query is veterinary, emergency, or irrelevant.
+    - **Query Refinement:** Expands and clarifies the query, optionally using image context.
+    - **Decomposition:** Breaks complex queries into focused sub-queries (including visual sub-queries).
+    - **Contextual Retrieval:** Each sub-query retrieves top-k relevant text and image summaries from the vector DB.
+    - **Multimodal Reranking:** Retrieved results are reranked using a cross-encoder or vision-language reranker (e.g., JinaAI/jina-reranker-m0), supporting both text and images for improved relevance.
+    - **Answer Synthesis:** The top reranked results are synthesized into a final answer, optionally with follow-up suggestions.
 
-1. **Ingestion:**  
-   - Load a PDF and extract its elements (text, tables, images).
-   - Clean and chunk the text, enrich image context, and filter irrelevant images.
-   - Summarize text, tables, and images (with context-aware prompts for images).
-   - Store summaries and originals in ChromaDB vector stores using OpenCLIP embeddings.
+## Example Workflow
 
-2. **Retrieval:**  
-   - User submits a natural language query.
-   - The query is embedded with OpenCLIP and used to search the summary vector store.
-   - Top results (text, table, or image summaries) are returned, with links to the original content.
+1. **Ingestion:**
+   - Load a PDF, extract and clean all elements, chunk text, summarize images, embed, and store in ChromaDB.
+2. **User Query:**
+   - "What are the signs of otitis in cats?"
+3. **LangGraph Flow:**
+   - Classify → Refine → Decompose → Retrieve (text + images) → Rerank → Synthesize answer.
+4. **Output:**
+   - Returns the most relevant text and image results, with links to original textbook content.
 
-## Example Query
-
-> "How do I safely pick up a cat for examination?"
-
-- Returns relevant text instructions, tables, and images (with summaries) about cat handling and restraint.
-
-## Setup
-
-1. **Install dependencies:**
-   ```bash
-   pip install langchain langchain-experimental langchain-chroma pillow open_clip_torch torch matplotlib unstructured pydantic
-   ```
-
-2. **Prepare your data:**
-   - Place your PDF(s) in the `./data/` directory.
-
-3. **Run the ingestion pipeline:**
-   ```python
-   # Example usage in a script or notebook
-   from textbook_loading import run_ingestion
-   retriever = run_ingestion('./data/your_textbook.pdf')
-   ```
-
-4. **Query the retriever:**
-   ```python
-   query = "How to pick up a cooperative cat?"
-   docs = retriever.invoke(query, k=8)
-   for doc in docs:
-       print(doc.page_content)
-       # Use doc.metadata['image_path'] to display images if needed
-   ```
-
-## Customization
-
-- **Image Summarization Prompt:**  
-  The prompt for image summarization is context-aware and can be customized in `textbook_loading.py` for your specific needs.
-
-- **Chunking Window Size:**  
-  Adjust the `window_size` parameter in `clean_and_categorize_elements` for more or less context around images.
+## Key Features
+- **Multimodal:** Unified retrieval and reranking for both text and images.
+- **Context-aware:** Image summaries and retrieval are enriched by local and semantic context.
+- **Flexible Reranking:** Supports advanced rerankers (e.g., JinaAI/jina-reranker-m0) for improved result quality.
+- **Traceable:** Every summary links back to its original textbook element.
 
 ## Notes
-
-- **OpenCLIP** is used for all embeddings, ensuring text and images are in the same vector space.
-- **ChromaDB** is used for fast vector search and persistent storage.
-- **Ollama** and vision-language models (e.g., `llava:7b`, `minicpm-v:8b`) are used for image relevance and summarization.
-
-## Troubleshooting
-
-- If you change your chunking, summarization, or ingestion logic, **delete the ChromaDB directory and re-ingest** to avoid stale or mismatched data.
-- Make sure all dependencies are installed and your models are available locally.
+- **Re-ingest** if you change chunking, summarization, or ingestion logic to avoid stale data in ChromaDB.
+- **Dependencies:** Requires OpenCLIP, ChromaDB, LangChain, and a vision-language model for image summarization and reranking.
 
 ## License
 
