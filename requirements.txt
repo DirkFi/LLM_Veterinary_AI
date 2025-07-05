@@ -1,0 +1,36 @@
+# Core dependencies
+langchain>=0.1.14,<0.2.0
+langchain-experimental>=0.0.50,<0.1.0
+langchain-chroma>=0.0.7,<0.1.0
+chroma-hnswlib>=0.7.3,<0.8.0
+open_clip_torch>=2.23.0,<3.0.0
+ollama>=0.1.6,<0.2.0
+pydantic>=2.0.0,<3.0.0
+unstructured>=0.12.6,<0.13.0
+pillow>=10.0.0,<11.0.0
+matplotlib>=3.7.0,<4.0.0
+scikit-learn>=1.3.0,<2.0.0
+numpy>=1.24.0,<2.0.0
+
+# For PDF parsing
+pdfminer.six>=20221105
+
+# For reranking (optional, for rerankers/monoqwen and Jina)
+# rerankers[monovlm]  # Uncomment if using MonoQwen2VLReranker (requires NVIDIA GPU)
+# qwen-vl-utils       # For Qwen reranker
+# transformers>=4.36.0  # For Jina reranker and HuggingFace models
+# jinaai==3.21.0        # For Jina reranker (optional)
+# sentence-transformers>=2.2.2  # For CrossEncoder reranking
+
+# For notebook usage
+ipython>=8.0.0
+notebook>=7.0.0
+
+# For image display in notebooks
+ipywidgets>=8.0.0
+
+# System requirements (not installable via pip):
+# - Ollama (https://ollama.com/) must be installed and running for vision and LLM inference
+# - Some rerankers require NVIDIA GPU and CUDA drivers
+
+# If you use a requirements manager, you can install optional dependencies as needed for reranking or advanced features. 
