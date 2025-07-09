@@ -1,0 +1,39 @@
+# Core dependencies for langgraph_flow.ipynb
+langchain-core>=0.2.0
+langchain-ollama>=0.1.0
+langchain-chroma>=0.1.0
+langchain-experimental>=0.0.60
+
+# LLM and embedding models
+ollama>=0.1.0
+transformers>=4.40.0
+sentence-transformers>=2.7.0
+
+# Reranking models
+rerankers>=0.3.0
+# For monoQwen support (GPU only): rerankers[monovlm]
+qwen-vl-utils>=0.0.1
+
+# Vector store and retrieval
+chromadb>=0.4.0
+open-clip-torch>=2.20.0
+
+# Utility libraries
+typing-extensions>=4.5.0
+numpy>=1.24.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Image processing
+Pillow>=10.0.0
+
+# JSON and data handling
+pandas>=2.0.0
+
+# Optional: For GPU acceleration
+# torch-audio>=2.0.0
+# accelerate>=0.20.0
+
+# Development and notebook support
+jupyter>=1.0.0
+ipykernel>=6.0.0
