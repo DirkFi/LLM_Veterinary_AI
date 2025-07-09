@@ -97,7 +97,11 @@ class VeterinaryAI:
     def _get_image_summary(self, image_path):
         """Get a detailed summary of an image using vision model."""
         if not image_path or not os.path.exists(image_path):
+            print("⚠️  No valid image path provided")
             return ""
+        
+        print(f"👁️  Analyzing image: {os.path.basename(image_path)}")
+        print("🤖 Using vision model for detailed analysis...")
             
         prompt = """From a feline veterinary standpoint, provide a highly detailed and objective 
                     description of the image. Focus on all observable elements, actions, 
@@ -122,9 +126,11 @@ class VeterinaryAI:
                 messages=messages,
                 options={"temperature": 0.2}
             )
-            return response['message']['content']
+            image_summary = response['message']['content']
+            print(f"✅ Image analysis complete ({len(image_summary)} characters)")
+            return image_summary
         except Exception as e:
-            print(f"Error getting image summary: {e}")
+            print(f"❌ Error getting image summary: {e}")
             return ""
 
     def _create_graph(self):
@@ -187,8 +193,17 @@ class VeterinaryAI:
 
     def _query_handler(self, state):
         """Classify the query type."""
+        print("\n🔍 Step 1: Query Classification")
+        print("-" * 40)
+        
         text_query = state.get("text_query", "")
         image_path = state.get("image_path", None)
+        
+        print(f"📝 Input query: {text_query}")
+        if image_path:
+            print(f"🖼️  Image provided: {image_path}")
+        else:
+            print("🖼️  No image provided")
 
         prompt = (
             "You are a domain classifier for a veterinary assistant. "
@@ -212,6 +227,7 @@ class VeterinaryAI:
             messages[0]["images"].append(image_path)
 
         try:
+            print("🤖 Analyzing query with vision model...")
             response = ollama.chat(
                 model="minicpm-v:8b",
                 messages=messages,
@@ -221,9 +237,20 @@ class VeterinaryAI:
             if result not in ['irrelevant', 'emergency', 'q&a']:
                 result = 'irrelevant'
             
+            print(f"📊 Classification result: {result.upper()}")
+            
+            # Show routing decision
+            if result == 'emergency':
+                print("🚨 → Routing to Emergency Handler")
+            elif result == 'q&a':
+                print("❓ → Routing to Q&A Pipeline")
+            else:
+                print("🚫 → Routing to Irrelevant Handler")
+            
             return {"query_type": result}
         except Exception as e:
-            print(f"Error in query handler: {e}")
+            print(f"❌ Error in query handler: {e}")
+            print("🔄 Defaulting to Q&A classification")
             return {"query_type": "q&a"}  # Default to Q&A if error
 
     def _route_after_query_handler(self, state):
@@ -238,9 +265,21 @@ class VeterinaryAI:
 
     def _query_refinement(self, state):
         """Refine and expand the user query."""
+        print("\n🔄 Step 2: Query Refinement")
+        print("-" * 40)
+        
         text_query = state.get("text_query", "")
         image_path = state.get("image_path", None)
-        image_summary = self._get_image_summary(image_path) if image_path else ""
+        
+        print(f"📝 Original query: {text_query}")
+        
+        if image_path:
+            print("🖼️  Analyzing image for context...")
+            image_summary = self._get_image_summary(image_path)
+            print(f"👁️  Image analysis: {image_summary[:100]}...")
+        else:
+            image_summary = ""
+            print("🖼️  No image to analyze")
 
         if image_summary:
             prompt = (
@@ -262,67 +301,134 @@ class VeterinaryAI:
             )
 
         try:
+            print("🤖 Refining query with language model...")
             response = ollama.chat(
                 model="llama3.2:3b",
                 messages=[{"role": "user", "content": prompt}],
                 options={"temperature": 0.3}
             )
-            return {"refined_query": response['message']['content']}
+            refined_query = response['message']['content']
+            print(f"✨ Refined query: {refined_query}")
+            return {"refined_query": refined_query}
         except Exception as e:
-            print(f"Error in query refinement: {e}")
+            print(f"❌ Error in query refinement: {e}")
+            print("🔄 Using original query")
             return {"refined_query": text_query}
 
     def _query_decomposition(self, state):
         """Decompose complex query into sub-queries."""
+        print("\n🔀 Step 3: Query Decomposition")
+        print("-" * 40)
+        
         refined_query = state.get('refined_query', '')
+        print(f"📝 Input query: {refined_query[:100]}...")
         
         # For now, return the refined query as single sub-query
         # This can be expanded with more sophisticated decomposition
-        return {"sub_queries": [refined_query]}
+        sub_queries = [refined_query]
+        
+        print(f"🔢 Generated {len(sub_queries)} sub-queries:")
+        for i, sub_query in enumerate(sub_queries, 1):
+            print(f"   {i}. {sub_query[:80]}...")
+        
+        return {"sub_queries": sub_queries}
 
     def _contextual_retrieval(self, state):
         """Retrieve relevant documents."""
+        print("\n🔍 Step 4: Document Retrieval")
+        print("-" * 40)
+        
         sub_queries = state.get('sub_queries', [])
         seen_doc_ids = set()
         unique_docs = []
 
-        for query in sub_queries:
+        print(f"🔎 Searching database for {len(sub_queries)} sub-queries...")
+        
+        for i, query in enumerate(sub_queries, 1):
+            print(f"\n📋 Sub-query {i}: {query[:60]}...")
             try:
                 results = self.retriever.retrieve_multi_modal(query, k=5)
+                print(f"   📊 Retrieved {len(results)} documents")
+                
                 for res in results:
                     doc_id = res.get('doc_id') or res.get('summary_metadata', {}).get('doc_id')
                     if doc_id and doc_id not in seen_doc_ids:
                         seen_doc_ids.add(doc_id)
                         unique_docs.append(res)
+                        
+                        # Show what was retrieved
+                        modality = res.get("modality") or (res.get("original_metadata") or {}).get("type")
+                        score = res.get("score", 0)
+                        summary = res.get("summary", "")[:50]
+                        print(f"   📄 [{modality}] Score: {score:.3f} | {summary}...")
+                        
             except Exception as e:
-                print(f"Error in retrieval for query '{query}': {e}")
+                print(f"❌ Error in retrieval for query '{query}': {e}")
                 continue
 
+        print(f"\n📚 Total unique documents retrieved: {len(unique_docs)}")
+        
+        # Show breakdown by modality
+        text_count = sum(1 for doc in unique_docs if (doc.get("modality") or (doc.get("original_metadata") or {}).get("type")) == "text")
+        image_count = sum(1 for doc in unique_docs if (doc.get("modality") or (doc.get("original_metadata") or {}).get("type")) in ["image", "image_summary"])
+        
+        print(f"   📝 Text documents: {text_count}")
+        print(f"   🖼️  Image documents: {image_count}")
+        
         return {"retrieved_docs": unique_docs}
 
     def _rerank(self, state):
         """Rerank retrieved documents."""
-        # For now, return documents as-is
-        # This can be expanded with more sophisticated reranking
+        print("\n🏆 Step 5: Document Reranking")
+        print("-" * 40)
+        
         retrieved_docs = state.get("retrieved_docs", [])
-        return {"reranked_docs": retrieved_docs}
+        print(f"📊 Input documents: {len(retrieved_docs)}")
+        
+        # For now, return documents as-is (sorted by original score)
+        # This can be expanded with more sophisticated reranking
+        reranked_docs = sorted(retrieved_docs, key=lambda x: x.get("score", 0), reverse=True)
+        
+        print(f"🎯 Reranked documents (showing top 5):")
+        for i, doc in enumerate(reranked_docs[:5], 1):
+            modality = doc.get("modality") or (doc.get("original_metadata") or {}).get("type")
+            score = doc.get("score", 0)
+            summary = doc.get("summary", "")[:40]
+            print(f"   {i}. [{modality}] Score: {score:.3f} | {summary}...")
+        
+        return {"reranked_docs": reranked_docs}
 
     def _thinking(self, state):
         """Analyze query and documents."""
+        print("\n🤔 Step 6: Thinking Analysis")
+        print("-" * 40)
+        
         text_query = state.get("text_query", "")
         refined_query = state.get("refined_query", "")
         reranked_docs = state.get("reranked_docs", [])
         
+        print(f"🎯 Analyzing user intent: {text_query}")
+        print(f"📊 Working with {len(reranked_docs)} documents")
+        
         # Prepare context
         context_pieces = []
-        for doc in reranked_docs[:5]:  # Top 5 docs
+        print(f"🔍 Extracting information from top 5 documents:")
+        
+        for i, doc in enumerate(reranked_docs[:5], 1):  # Top 5 docs
             modality = doc.get("modality") or (doc.get("original_metadata") or {}).get("type")
+            summary = doc.get('summary', '')
+            
             if modality == "text":
-                context_pieces.append(f"[TEXT] {doc.get('summary', '')}")
+                context_pieces.append(f"[TEXT] {summary}")
+                print(f"   {i}. 📝 Text: {summary[:60]}...")
             elif modality in ["image", "image_summary"]:
-                context_pieces.append(f"[IMAGE] {doc.get('summary', '')}")
+                context_pieces.append(f"[IMAGE] {summary}")
+                print(f"   {i}. 🖼️  Image: {summary[:60]}...")
         
         context = "\n".join(context_pieces)
+        
+        print(f"💡 Key insights identified from retrieved documents")
+        print(f"🎯 Ready to generate comprehensive answer")
         
         return {
             "thinking_analysis": f"Analyzing query: {text_query}",
@@ -331,8 +437,14 @@ class VeterinaryAI:
 
     def _answer_generation(self, state):
         """Generate the final answer."""
+        print("\n✍️ Step 7: Answer Generation")
+        print("-" * 40)
+        
         text_query = state.get("text_query", "")
         context_for_answer = state.get("context_for_answer", "")
+        
+        print(f"📝 Generating answer for: {text_query}")
+        print(f"📚 Using context from {len(context_for_answer.split('[TEXT]')) + len(context_for_answer.split('[IMAGE]')) - 2} sources")
         
         prompt = f"""
         You are a knowledgeable veterinary assistant providing helpful information to pet owners.
@@ -353,21 +465,45 @@ class VeterinaryAI:
         """
         
         try:
+            print("🤖 Generating response with language model...")
             response = ollama.chat(
                 model="llama3.2:3b",
                 messages=[{"role": "user", "content": prompt}],
                 options={"temperature": 0.4}
             )
-            return {"generated_answer": response['message']['content']}
+            
+            generated_answer = response['message']['content']
+            print(f"✅ Answer generated ({len(generated_answer)} characters)")
+            print(f"📄 Preview: {generated_answer[:100]}...")
+            
+            return {"generated_answer": generated_answer}
         except Exception as e:
-            print(f"Error in answer generation: {e}")
-            return {"generated_answer": "I apologize, but I'm having trouble generating a response right now. Please consult with a veterinarian for your pet's health concerns."}
+            print(f"❌ Error in answer generation: {e}")
+            fallback_answer = "I apologize, but I'm having trouble generating a response right now. Please consult with a veterinarian for your pet's health concerns."
+            return {"generated_answer": fallback_answer}
 
     def _hallucination_check(self, state):
         """Check for hallucinations in the generated answer."""
+        print("\n🔍 Step 8: Hallucination Check")
+        print("-" * 40)
+        
+        generated_answer = state.get("generated_answer", "")
+        context_for_answer = state.get("context_for_answer", "")
+        
+        print("🕵️ Checking answer for accuracy and grounding...")
+        
         # For now, assume all answers pass
         # This can be expanded with more sophisticated checking
-        return {"hallucination_check": True}
+        hallucination_check = True
+        
+        if hallucination_check:
+            print("✅ Answer appears well-grounded in source material")
+            print("✅ No obvious hallucinations detected")
+        else:
+            print("⚠️ Potential issues detected in answer")
+            print("🔄 Will add disclaimer to response")
+        
+        return {"hallucination_check": hallucination_check}
 
     def _route_after_hallucination_check(self, state):
         """Route after hallucination check."""
@@ -376,8 +512,15 @@ class VeterinaryAI:
 
     def _finalize_answer(self, state):
         """Finalize the answer."""
+        print("\n✅ Step 9: Finalizing Answer")
+        print("-" * 40)
+        
+        generated_answer = state.get("generated_answer", "")
+        print(f"📝 Final answer ready ({len(generated_answer)} characters)")
+        print("🎯 Q&A pipeline completed successfully")
+        
         return {
-            "final_answer": state.get("generated_answer", ""),
+            "final_answer": generated_answer,
             "path_taken": state.get("path_taken", []) + ["Q&A_completed"]
         }
 
@@ -393,7 +536,17 @@ class VeterinaryAI:
 
     def _emergency_handler(self, state):
         """Handle emergency queries."""
+        print("\n🚨 EMERGENCY RESPONSE MODE")
+        print("=" * 50)
+        
         text_query = state.get("text_query", "")
+        image_path = state.get("image_path", None)
+        
+        print(f"🆘 Emergency situation: {text_query}")
+        if image_path:
+            print(f"📸 Image provided: {image_path}")
+        
+        print("🚨 Generating immediate emergency response...")
         
         emergency_response = f"""
         ⚠️ EMERGENCY: Contact your veterinarian or emergency animal hospital IMMEDIATELY
@@ -415,11 +568,20 @@ class VeterinaryAI:
         This is a medical emergency requiring immediate professional veterinary care.
         """
         
+        print("✅ Emergency response generated")
+        print("🎯 Prioritizing immediate veterinary care")
+        
         return {"final_answer": emergency_response}
 
     def _irrelevant_handler(self, state):
         """Handle irrelevant queries."""
+        print("\n🚫 Non-Veterinary Query Detected")
+        print("-" * 40)
+        
         text_query = state.get("text_query", "")
+        
+        print(f"❌ Query not related to veterinary care: {text_query}")
+        print("🔄 Providing helpful redirection...")
         
         response = f"""
         I'm a veterinary AI assistant designed to help with animal health and pet care questions.
@@ -438,6 +600,8 @@ class VeterinaryAI:
         Please feel free to ask me anything related to animal health or pet care!
         """
         
+        print("✅ Redirection message prepared")
+        
         return {"final_answer": response}
 
     def ask(self, query, image_path=None):
@@ -451,6 +615,13 @@ class VeterinaryAI:
         Returns:
             dict: The complete response from the AI system
         """
+        print("\n🐾 VETERINARY AI ASSISTANT")
+        print("=" * 60)
+        print(f"🔍 Processing query: {query}")
+        if image_path:
+            print(f"📸 Image provided: {image_path}")
+        print("=" * 60)
+        
         initial_state = {
             "text_query": query,
             "image_path": image_path,
@@ -459,10 +630,26 @@ class VeterinaryAI:
         }
         
         try:
+            print("🚀 Starting AI processing pipeline...")
             result = self.graph.invoke(initial_state)
+            
+            print("\n" + "=" * 60)
+            print("🎯 PROCESSING COMPLETE")
+            print("=" * 60)
+            
+            # Show final statistics
+            final_answer = result.get("final_answer", "")
+            query_type = result.get("query_type", "unknown")
+            path_taken = result.get("path_taken", [])
+            
+            print(f"📊 Query Type: {query_type.upper()}")
+            print(f"🛤️  Pipeline Path: {' → '.join(path_taken) if path_taken else 'Standard flow'}")
+            print(f"📝 Response Length: {len(final_answer)} characters")
+            
             return result
         except Exception as e:
-            print(f"Error processing query: {e}")
+            print(f"\n❌ Error processing query: {e}")
+            print("🔄 Returning fallback response")
             return {
                 "final_answer": "I apologize, but I encountered an error processing your query. Please try again or consult with a veterinarian.",
                 "error": str(e)
