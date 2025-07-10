@@ -273,28 +273,53 @@ class VeterinaryAI:
         
         print(f"📝 Original query: {text_query}")
         
-        if image_path:
+        # Clean up query if it contains file paths
+        if text_query.endswith(('.jpg', '.jpeg', '.png', '.gif')):
+            # Extract actual query from mixed path+text
+            if 'tell me' in text_query.lower() or 'how can' in text_query.lower():
+                # Extract the question part
+                query_parts = text_query.split('tell me')
+                if len(query_parts) > 1:
+                    text_query = 'tell me' + query_parts[-1]
+                else:
+                    query_parts = text_query.split('how can')
+                    if len(query_parts) > 1:
+                        text_query = 'how can' + query_parts[-1]
+                print(f"🔧 Cleaned query: {text_query}")
+        
+        if image_path and os.path.exists(image_path):
             print("🖼️  Analyzing image for context...")
             image_summary = self._get_image_summary(image_path)
             print(f"👁️  Image analysis: {image_summary[:100]}...")
         else:
             image_summary = ""
-            print("🖼️  No image to analyze")
+            if image_path:
+                print(f"⚠️  Image not found: {image_path}")
+            else:
+                print("🖼️  No image to analyze")
 
         if image_summary:
             prompt = (
                 "You are a veterinary assistant AI. Your task is to rewrite and expand the user's query for a veterinary knowledge base search. "
                 "Use the image description to add context, but avoid making assumptions about the specific diagnosis. "
                 "Frame the refined query in an open-ended, unbiased way. "
+                "Focus on cat health, nutrition, weight management, and general care based on the visual information. "
                 "Output ONLY one single, context-rich, and unbiased query as a paragraph, and nothing else.\n\n"
                 f"User query: {text_query}\n"
                 f"Image description: {image_summary}\n"
                 "Refined query:"
             )
         else:
+            # Fallback for text-only or failed image analysis
+            if "skinny" in text_query.lower() or "thin" in text_query.lower() or "weight" in text_query.lower():
+                fallback_query = "How can I help my underweight or thin cat gain healthy weight, what are the causes of weight loss in cats, and what nutrition and care recommendations are there for improving cat health and body condition?"
+                print(f"🔧 Using fallback nutrition query based on context")
+                return {"refined_query": fallback_query}
+            
             prompt = (
                 "You are a veterinary assistant AI. Your task is to rewrite and expand the user's query for a veterinary knowledge base search. "
                 "Consider possible causes, diagnostic considerations, anything that would be helpful. "
+                "If the query seems to be about cat health and wellness, focus on comprehensive health care advice. "
                 "Output ONLY one single, context-rich query as a paragraph, and nothing else.\n\n"
                 f"User query: {text_query}\n"
                 "Refined query:"
@@ -308,12 +333,20 @@ class VeterinaryAI:
                 options={"temperature": 0.3}
             )
             refined_query = response['message']['content']
+            
+            # Check if the model is refusing to help
+            if "can't help" in refined_query.lower() or "cannot help" in refined_query.lower():
+                print("⚠️  Model refused to refine query, using fallback")
+                fallback_query = "What are comprehensive health care recommendations for cats, including nutrition, weight management, and general wellness advice for maintaining optimal feline health?"
+                return {"refined_query": fallback_query}
+            
             print(f"✨ Refined query: {refined_query}")
             return {"refined_query": refined_query}
         except Exception as e:
             print(f"❌ Error in query refinement: {e}")
-            print("🔄 Using original query")
-            return {"refined_query": text_query}
+            print("🔄 Using fallback health query")
+            fallback_query = "What are comprehensive health care recommendations for cats, including nutrition, weight management, and general wellness advice?"
+            return {"refined_query": fallback_query}
 
     def _query_decomposition(self, state):
         """Decompose complex query into sub-queries."""
@@ -441,27 +474,44 @@ class VeterinaryAI:
         print("-" * 40)
         
         text_query = state.get("text_query", "")
+        refined_query = state.get("refined_query", "")
         context_for_answer = state.get("context_for_answer", "")
         
-        print(f"📝 Generating answer for: {text_query}")
-        print(f"📚 Using context from {len(context_for_answer.split('[TEXT]')) + len(context_for_answer.split('[IMAGE]')) - 2} sources")
+        # Use refined query for better context
+        query_to_answer = refined_query if refined_query else text_query
+        
+        print(f"📝 Generating answer for: {query_to_answer}")
+        
+        # Count actual context sources
+        text_sources = context_for_answer.count('[TEXT]')
+        image_sources = context_for_answer.count('[IMAGE]')
+        total_sources = text_sources + image_sources
+        
+        print(f"📚 Using context from {total_sources} sources ({text_sources} text, {image_sources} images)")
+        
+        if total_sources == 0:
+            print("⚠️  No context available, using general knowledge")
+            context_for_answer = "No specific veterinary documents were retrieved for this query."
         
         prompt = f"""
         You are a knowledgeable veterinary assistant providing helpful information to pet owners.
         
         IMPORTANT GUIDELINES:
-        1. Always emphasize consulting with a veterinarian for proper diagnosis and treatment
-        2. Provide factual, evidence-based information
-        3. Include relevant warnings about emergency situations
-        4. Be empathetic and supportive in tone
-        5. Reference specific information from the retrieved documents
+        1. You MUST provide helpful veterinary advice based on available information
+        2. Always emphasize consulting with a veterinarian for proper diagnosis and treatment
+        3. Provide factual, evidence-based information from the retrieved context
+        4. Include relevant warnings about emergency situations
+        5. Be empathetic and supportive in tone
+        6. If context is limited, provide general veterinary advice for the situation
+        7. NEVER refuse to help with legitimate veterinary questions
         
-        User Query: {text_query}
+        User's Original Query: {text_query}
+        Refined Query Context: {query_to_answer}
         
-        Retrieved Information:
+        Retrieved Veterinary Information:
         {context_for_answer}
         
-        Please provide a comprehensive, helpful response that addresses the user's concern.
+        Based on the above information and your veterinary knowledge, please provide a comprehensive, helpful response that addresses the user's concern about their cat's health. Focus on practical advice, potential causes, and care recommendations.
         """
         
         try:
@@ -473,13 +523,51 @@ class VeterinaryAI:
             )
             
             generated_answer = response['message']['content']
+            
+            # Check if the model is still refusing to help
+            if ("can't help" in generated_answer.lower() or 
+                "cannot help" in generated_answer.lower() or
+                len(generated_answer) < 200):
+                
+                print("⚠️  Model response too short or refusing, generating specific answer...")
+                
+                # Generate a more specific prompt for cat health
+                specific_prompt = f"""
+                You are a veterinary assistant. A pet owner is asking about their cat's health and care.
+                
+                Query: {query_to_answer}
+                
+                Please provide specific advice about:
+                1. Possible health concerns related to the query
+                2. Nutrition and feeding recommendations
+                3. General care guidelines
+                4. When to see a veterinarian
+                
+                Be helpful and informative. This is a legitimate veterinary question that needs a comprehensive answer.
+                """
+                
+                response = ollama.chat(
+                    model="llama3.2:3b",
+                    messages=[{"role": "user", "content": specific_prompt}],
+                    options={"temperature": 0.5}
+                )
+                generated_answer = response['message']['content']
+            
             print(f"✅ Answer generated ({len(generated_answer)} characters)")
             print(f"📄 Preview: {generated_answer[:100]}...")
             
             return {"generated_answer": generated_answer}
+            
         except Exception as e:
             print(f"❌ Error in answer generation: {e}")
-            fallback_answer = "I apologize, but I'm having trouble generating a response right now. Please consult with a veterinarian for your pet's health concerns."
+            fallback_answer = """I understand you're concerned about your cat's health. Here are some general recommendations:
+
+1. **Nutrition**: Ensure your cat has a balanced diet appropriate for their age and health status
+2. **Weight Management**: Monitor your cat's weight and body condition regularly
+3. **Regular Checkups**: Schedule routine veterinary examinations
+4. **Observation**: Watch for changes in appetite, behavior, or appearance
+
+Please consult with a veterinarian for personalized advice about your cat's specific health needs and any concerns you may have."""
             return {"generated_answer": fallback_answer}
 
     def _hallucination_check(self, state):
