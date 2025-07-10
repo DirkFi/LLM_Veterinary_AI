@@ -460,6 +460,12 @@ class VeterinaryAI:
         
         context = "\n".join(context_pieces)
         
+        # Debug: Show context being passed
+        print(f"🔍 Context pieces assembled: {len(context_pieces)} pieces")
+        print(f"🔍 Final context length: {len(context)} characters")
+        if context:
+            print(f"🔍 Context preview: {context[:150]}...")
+        
         print(f"💡 Key insights identified from retrieved documents")
         print(f"🎯 Ready to generate comprehensive answer")
         
@@ -482,6 +488,13 @@ class VeterinaryAI:
         
         print(f"📝 Generating answer for: {query_to_answer}")
         
+        # Debug: Show raw context content
+        print(f"🔍 Debug - Context length: {len(context_for_answer)} characters")
+        if context_for_answer:
+            print(f"🔍 Debug - Context preview: {context_for_answer[:200]}...")
+        else:
+            print("🔍 Debug - Context is empty!")
+        
         # Count actual context sources
         text_sources = context_for_answer.count('[TEXT]')
         image_sources = context_for_answer.count('[IMAGE]')
@@ -491,7 +504,9 @@ class VeterinaryAI:
         
         if total_sources == 0:
             print("⚠️  No context available, using general knowledge")
-            context_for_answer = "No specific veterinary documents were retrieved for this query."
+            # Don't override the context if it exists but doesn't have tags
+            if not context_for_answer.strip():
+                context_for_answer = "No specific veterinary documents were retrieved for this query."
         
         prompt = f"""
         You are a knowledgeable veterinary assistant providing helpful information to pet owners.
