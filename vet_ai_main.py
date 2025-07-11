@@ -41,6 +41,8 @@ class GraphState(TypedDict):
     loop_count: int
 
     # Answer generation
+    thinking_analysis: Optional[str]
+    context_for_answer: Optional[str]
     generated_answer: Optional[str]
     hallucination_check: Optional[bool]
     answer_sufficient: Optional[bool]
@@ -482,6 +484,25 @@ class VeterinaryAI:
         text_query = state.get("text_query", "")
         refined_query = state.get("refined_query", "")
         context_for_answer = state.get("context_for_answer", "")
+        
+        # Debug: Check all available state keys
+        print(f"🔍 Debug - Available state keys: {list(state.keys())}")
+        print(f"🔍 Debug - State contains context_for_answer: {'context_for_answer' in state}")
+        
+        # Try alternative state access methods
+        if not context_for_answer:
+            # Check if context is in thinking_analysis or another field
+            thinking_analysis = state.get("thinking_analysis", "")
+            print(f"🔍 Debug - Thinking analysis length: {len(thinking_analysis)}")
+            
+            # Check if context might be in a different field name
+            for key in state.keys():
+                if 'context' in key.lower():
+                    value = state.get(key, "")
+                    print(f"🔍 Debug - Found context-like key '{key}': {len(value)} chars")
+                    if len(value) > len(context_for_answer):
+                        context_for_answer = value
+                        print(f"🔍 Debug - Using {key} as context source")
         
         # Use refined query for better context
         query_to_answer = refined_query if refined_query else text_query
